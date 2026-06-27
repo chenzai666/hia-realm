@@ -1,895 +1,868 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
 CONFIG_FILE="/etc/realm/config.toml"
-PANEL_DATA_FILE="/etc/realm/panel_data.json"
 REALM_BIN="/usr/local/bin/realm"
 SERVICE_FILE="/etc/systemd/system/realm.service"
-PANEL_SERVICE_FILE="/etc/systemd/system/realm-panel.service"
-TMP_DIR="/tmp/realm-install"
-
+PANEL_BIN="/usr/local/bin/realm-panel"
+PANEL_SERVICE="realm-panel.service"
+PANEL_SERVICE_FILE="/etc/systemd/system/${PANEL_SERVICE}"
 REALM_DIR="/etc/realm"
 BACKUP_DIR="/etc/realm/backups"
-DEFAULT_EXPORT_FILE="$BACKUP_DIR/realm-backup.tar.gz"
-DEFAULT_IMPORT_FILE="$BACKUP_DIR/realm-backup.tar.gz"
+PANEL_DATA="/etc/realm/panel_data.json"
+TMP_DIR="/tmp/realm-install"
+LOG_FILE="/var/log/realm-manager.log"
 
-CRON_FILE="/etc/cron.d/realm-rules-export"
-EXPORT_HELPER="/usr/local/bin/realm-export-rules.sh"
+PANEL_PORT_DEFAULT="4794"
+PANEL_USER_DEFAULT="admin"
+PANEL_PASS_DEFAULT="123456"
+PANEL_CERT_DEFAULT="/root/ygkkkca/cert.crt"
+PANEL_KEY_DEFAULT="/root/ygkkkca/private.key"
 
-GREEN="\e[32m"
-RED="\e[31m"
-YELLOW="\e[33m"
-RESET="\e[0m"
+GREEN="\033[32m"
+RED="\033[31m"
+YELLOW="\033[33m"
+CYAN="\033[36m"
+RESET="\033[0m"
+
+info() { printf "${GREEN}[信息]${RESET} %s\n" "$1"; }
+warn() { printf "${YELLOW}[警告]${RESET} %s\n" "$1"; }
+err() { printf "${RED}[错误]${RESET} %s\n" "$1"; }
+
+log_action() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE" 2>/dev/null || true
+}
 
 check_root() {
-  if [ "$EUID" -ne 0 ]; then
-    echo -e "${RED}请以 root 用户运行此脚本。${RESET}"
-    exit 1
-  fi
+    if [[ "${EUID}" -ne 0 ]]; then
+        err "请以 root 用户运行此脚本。"
+        exit 1
+    fi
 }
 
 need_cmd() {
-  command -v "$1" >/dev/null 2>&1 || {
-    echo -e "${RED}缺少依赖命令：$1，请先安装。${RESET}"
-    exit 1
-  }
+    command -v "$1" >/dev/null 2>&1 || {
+        err "缺少依赖命令: $1"
+        return 1
+    }
+}
+
+validate_port() {
+    local port="$1"
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    (( port >= 1 && port <= 65535 ))
+}
+
+validate_ip() {
+    local ip="$1"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    [[ "$ip" =~ (^|\.)0[0-9] ]] && return 1
+    local IFS='.' parts
+    read -ra parts <<< "$ip"
+    for p in "${parts[@]}"; do
+        (( p <= 255 )) || return 1
+    done
+}
+
+validate_public_ipv4() {
+    local ip="$1"
+    validate_ip "$ip" || return 1
+    local IFS='.' a b c d
+    read -r a b c d <<< "$ip"
+    (( a == 0 || a == 10 || a == 127 || a >= 224 )) && return 1
+    (( a == 100 && b >= 64 && b <= 127 )) && return 1
+    (( a == 169 && b == 254 )) && return 1
+    (( a == 172 && b >= 16 && b <= 31 )) && return 1
+    (( a == 192 && b == 168 )) && return 1
+    (( a == 198 && (b == 18 || b == 19) )) && return 1
+}
+
+sanitize_name() {
+    local name="$1"
+    name="${name//$'\r'/ }"
+    name="${name//$'\n'/ }"
+    name="${name//\"/}"
+    name=$(printf '%s' "$name" | sed -E 's/[[:cntrl:]]//g; s/^[[:space:]]+//; s/[[:space:]]+$//')
+    printf '%s' "${name:0:60}"
+}
+
+get_local_ip() {
+    local ip
+    ip=$(curl -s4 --max-time 4 ifconfig.me 2>/dev/null || true)
+    [[ -n "$ip" ]] && { echo "$ip"; return; }
+    hostname -I 2>/dev/null | awk '{print $1}' || echo "服务器IP"
 }
 
 is_installed() {
-  [ -x "$REALM_BIN" ] && [ -f "$SERVICE_FILE" ]
+    [[ -x "$REALM_BIN" && -f "$SERVICE_FILE" ]]
 }
 
-require_installed() {
-  if ! is_installed; then
-    echo -e "${RED}Realm 未安装，请先选择 1 安装。${RESET}"
-    return 1
-  fi
-  return 0
+ensure_dirs() {
+    mkdir -p "$REALM_DIR" "$BACKUP_DIR"
+    touch "$LOG_FILE" 2>/dev/null || true
 }
 
 ensure_config_file() {
-  mkdir -p "$(dirname "$CONFIG_FILE")"
-  if [ ! -f "$CONFIG_FILE" ] || [ ! -s "$CONFIG_FILE" ]; then
-    cat > "$CONFIG_FILE" <<EOF
+    ensure_dirs
+    if [[ ! -s "$CONFIG_FILE" ]]; then
+        cat > "$CONFIG_FILE" <<'EOF'
 [[endpoints]]
 name = "system-keepalive"
 listen = "127.0.0.1:65534"
 remote = "127.0.0.1:65534"
+type = "tcp+udp"
 EOF
-  fi
+    fi
 }
 
-validate_name() {
-  local name="$1"
-  [ -z "$name" ] && return 1
-  local len
-  len="$(printf "%s" "$name" | wc -m | tr -d ' ')"
-  [ "$len" -lt 1 ] || [ "$len" -gt 50 ] && return 1
-  if command -v iconv >/dev/null 2>&1; then
-    printf "%s" "$name" | iconv -f UTF-8 -t UTF-8 >/dev/null 2>&1 || return 1
-  fi
-  if printf "%s" "$name" | LC_ALL=C awk '{for(i=1;i<=length($0);i++){c=substr($0,i,1);if(c~/[[:cntrl:]]/)exit 1}exit 0}'; then :; else return 1; fi
-  printf "%s" "$name" | awk 'BEGIN{ok=1}{if($0~/[^0-9A-Za-z_一-龥-]/)ok=0}END{exit ok?0:1}' || return 1
-  return 0
+backup_config() {
+    ensure_dirs
+    if [[ -f "$CONFIG_FILE" ]]; then
+        cp "$CONFIG_FILE" "$BACKUP_DIR/config.toml.$(date '+%Y%m%d_%H%M%S')" 2>/dev/null || true
+    fi
 }
 
-restart_realm_silent() {
-  if ! systemctl restart realm >/dev/null 2>&1; then
-    systemctl restart realm || true
-  fi
-  if [ -f "$PANEL_SERVICE_FILE" ]; then
-      systemctl restart realm-panel >/dev/null 2>&1 || true
-  fi
+detect_pkg_manager() {
+    if command -v apt-get >/dev/null 2>&1; then echo apt
+    elif command -v dnf >/dev/null 2>&1; then echo dnf
+    elif command -v yum >/dev/null 2>&1; then echo yum
+    elif command -v apk >/dev/null 2>&1; then echo apk
+    else echo unknown
+    fi
 }
 
-restart_realm_verbose() {
-  systemctl restart realm
-  echo -e "${GREEN}Realm 已重启。${RESET}"
-  if [ -f "$PANEL_SERVICE_FILE" ]; then
-      systemctl restart realm-panel
-      echo -e "${GREEN}Realm 面板已重启。${RESET}"
-  fi
-}
-
-get_realm_version_short() {
-  local raw ver
-  raw="$($REALM_BIN --version 2>/dev/null || true)"
-  ver="$(echo "$raw" | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]/){print $i; exit}}')"
-  [ -z "$ver" ] && echo "未知" || echo "$ver"
-}
-
-get_status_line() {
-  if ! is_installed; then
-    echo -e "状态：${YELLOW}未安装${RESET}"
-    return
-  fi
-  local status ver
-  status="$(systemctl is-active realm 2>/dev/null || true)"
-  ver="$(get_realm_version_short)"
-  if [ "$status" = "active" ]; then
-    echo -e "状态：${GREEN}运行中${RESET}  |  版本：${GREEN}${ver}${RESET}"
-  else
-    echo -e "状态：${RED}未运行${RESET}  |  版本：${GREEN}${ver}${RESET}"
-  fi
+install_base_deps() {
+    local pm
+    pm=$(detect_pkg_manager)
+    case "$pm" in
+        apt)
+            apt-get update -y >/dev/null 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y curl tar ca-certificates python3 >/dev/null 2>&1
+            ;;
+        dnf) dnf install -y curl tar ca-certificates python3 >/dev/null 2>&1 ;;
+        yum) yum install -y curl tar ca-certificates python3 >/dev/null 2>&1 ;;
+        apk) apk add --no-cache curl tar ca-certificates python3 >/dev/null 2>&1 ;;
+        *) ;;
+    esac
 }
 
 get_arch() {
-  local arch
-  arch="$(uname -m)"
-  case "$arch" in
-    x86_64) echo "x86_64" ;;
-    aarch64|arm64) echo "aarch64" ;;
-    armv7l|armv6l) echo "armv7" ;;
-    *) echo "unsupported" ;;
-  esac
+    case "$(uname -m)" in
+        x86_64) echo x86_64 ;;
+        aarch64|arm64) echo aarch64 ;;
+        armv7l|armv6l) echo armv7 ;;
+        *) echo unsupported ;;
+    esac
 }
 
 get_libc() {
-  if ldd --version 2>&1 | grep -qi musl; then echo "musl"; else echo "gnu"; fi
+    if ldd --version 2>&1 | grep -qi musl; then echo musl; else echo gnu; fi
 }
 
 get_realm_filename() {
-  local arch libc
-  arch="$(get_arch)"
-  libc="$(get_libc)"
-  case "$arch" in
-    x86_64) echo "realm-x86_64-unknown-linux-$libc.tar.gz" ;;
-    aarch64) echo "realm-aarch64-unknown-linux-$libc.tar.gz" ;;
-    armv7)
-      if [ "$libc" = "musl" ]; then
-        echo "realm-armv7-unknown-linux-musleabihf.tar.gz"
-      else
-        echo "realm-armv7-unknown-linux-gnueabihf.tar.gz"
-      fi
-      ;;
-    *) echo "" ;;
-  esac
+    local arch libc
+    arch=$(get_arch)
+    libc=$(get_libc)
+    case "$arch" in
+        x86_64) echo "realm-x86_64-unknown-linux-${libc}.tar.gz" ;;
+        aarch64) echo "realm-aarch64-unknown-linux-${libc}.tar.gz" ;;
+        armv7)
+            if [[ "$libc" == "musl" ]]; then
+                echo "realm-armv7-unknown-linux-musleabihf.tar.gz"
+            else
+                echo "realm-armv7-unknown-linux-gnueabihf.tar.gz"
+            fi
+            ;;
+        *) echo "" ;;
+    esac
 }
 
 get_latest_realm_url() {
-  local file
-  file="$(get_realm_filename)"
-  [ -z "$file" ] && return 1
-  curl -s https://api.github.com/repos/zhboner/realm/releases/latest \
-    | grep browser_download_url \
-    | grep "$file" \
-    | cut -d '"' -f 4
+    local file
+    file=$(get_realm_filename)
+    [[ -z "$file" ]] && return 1
+    curl -fsSL https://api.github.com/repos/zhboner/realm/releases/latest \
+        | grep browser_download_url \
+        | grep "$file" \
+        | cut -d '"' -f 4 \
+        | head -1
 }
 
-install_realm_inner() {
-  need_cmd curl
-  need_cmd tar
-  need_cmd systemctl
-  echo -e "${GREEN}正在安装 Realm ...${RESET}"
-  echo -e "${YELLOW}正在执行系统内核 LimitNOFILE 优化...${RESET}"
-  if [ ! -f "/etc/sysctl.d/99-realm.conf" ]; then
-      cat > /etc/sysctl.d/99-realm.conf <<EOF
-fs.file-max = 1000000
-fs.inotify.max_user_instances = 8192
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.ip_local_port_range = 1024 65000
-net.ipv4.tcp_max_syn_backlog = 10240
-net.ipv4.tcp_max_tw_buckets = 5000
-net.ipv4.tcp_fastopen = 3
-EOF
-      sysctl -p /etc/sysctl.d/99-realm.conf >/dev/null 2>&1 || true
-  fi
-  ulimit -n 1000000 >/dev/null 2>&1 || true
-  local arch libc file url
-  arch="$(get_arch)"
-  libc="$(get_libc)"
-  file="$(get_realm_filename)"
-  if [ "$arch" = "unsupported" ] || [ -z "$file" ]; then
-    echo -e "${RED}不支持的架构：$(uname -m)${RESET}"
-    exit 1
-  fi
-  url="$(get_latest_realm_url || true)"
-  if [ -z "$url" ]; then
-    echo -e "${RED}获取 Realm 最新版本下载地址失败。${RESET}"
-    exit 1
-  fi
-  echo -e "${GREEN}检测到架构：$arch  libc：$libc${RESET}"
-  echo -e "${GREEN}将下载：$file${RESET}"
-  mkdir -p "$TMP_DIR"
-  cd "$TMP_DIR" || exit 1
-  rm -f realm.tar.gz realm
-  curl -L -o realm.tar.gz "$url"
-  tar -xzf realm.tar.gz
-  if [ ! -f "realm" ]; then
-    echo -e "${RED}解压后未找到 realm 可执行文件。${RESET}"
-    exit 1
-  fi
-  mv realm "$REALM_BIN"
-  chmod +x "$REALM_BIN"
-  cat > "$SERVICE_FILE" <<EOF
+get_realm_version() {
+    "$REALM_BIN" --version 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]/){print $i; exit}}' || true
+}
+
+install_realm() {
+    check_root
+    install_base_deps
+    need_cmd curl
+    need_cmd tar
+    need_cmd systemctl
+
+    local url file arch
+    arch=$(get_arch)
+    file=$(get_realm_filename)
+    if [[ "$arch" == "unsupported" || -z "$file" ]]; then
+        err "不支持的架构: $(uname -m)"
+        return 1
+    fi
+
+    url=$(get_latest_realm_url || true)
+    if [[ -z "$url" ]]; then
+        err "获取 Realm 最新版本下载地址失败。"
+        return 1
+    fi
+
+    info "正在安装/更新 Realm: ${file}"
+    mkdir -p "$TMP_DIR"
+    rm -f "$TMP_DIR/realm.tar.gz" "$TMP_DIR/realm"
+    curl -L -o "$TMP_DIR/realm.tar.gz" "$url"
+    tar -xzf "$TMP_DIR/realm.tar.gz" -C "$TMP_DIR"
+    if [[ ! -f "$TMP_DIR/realm" ]]; then
+        err "解压后未找到 realm 可执行文件。"
+        return 1
+    fi
+    mv "$TMP_DIR/realm" "$REALM_BIN"
+    chmod +x "$REALM_BIN"
+
+    ensure_config_file
+    cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=Realm Proxy
 After=network-online.target
 Wants=network-online.target
+
 [Service]
-ExecStart=$REALM_BIN -c $CONFIG_FILE
+ExecStart=${REALM_BIN} -c ${CONFIG_FILE}
 Restart=always
 LimitNOFILE=1000000
 LimitNPROC=1000000
+
 [Install]
 WantedBy=multi-user.target
 EOF
-  ensure_config_file
-  systemctl daemon-reexec
-  systemctl enable realm >/dev/null 2>&1 || true
-  systemctl restart realm
-  echo -e "${GREEN}完成。当前版本：$(get_realm_version_short)${RESET}"
-  echo -e "${GREEN}保活规则已添加，服务已自动启动。${RESET}"
+    systemctl daemon-reload
+    systemctl enable realm >/dev/null 2>&1 || true
+    systemctl restart realm
+    info "Realm 已安装/更新。当前版本: $(get_realm_version)"
+    log_action "安装/更新 Realm"
 }
 
-install_realm() {
-  if is_installed; then
-    echo -e "${YELLOW}Realm 已安装（版本：$(get_realm_version_short)）。是否更新到最新版本？[y/N]${RESET}"
-    read -r ANS
-    case "$ANS" in
-      y|Y) install_realm_inner ;;
-      *) echo -e "${YELLOW}已取消更新。${RESET}" ;;
-    esac
-  else
-    install_realm_inner
-  fi
-}
-
-cleanup_realm_firewall() {
-  echo -e "${YELLOW}>>> 正在彻底清理防火墙残留...${RESET}"
-
-  for BIN in iptables iptables-nft iptables-legacy; do
-    command -v "$BIN" >/dev/null 2>&1 || continue
-
-    "$BIN" -D INPUT   -j REALM_IN  2>/dev/null || true
-    "$BIN" -D OUTPUT  -j REALM_OUT 2>/dev/null || true
-    "$BIN" -D FORWARD -j REALM_OUT 2>/dev/null || true
-
-    "$BIN" -F REALM_IN  2>/dev/null || true
-    "$BIN" -F REALM_OUT 2>/dev/null || true
-    "$BIN" -X REALM_IN  2>/dev/null || true
-    "$BIN" -X REALM_OUT 2>/dev/null || true
-  done
-
-  for BIN in ip6tables ip6tables-nft ip6tables-legacy; do
-    command -v "$BIN" >/dev/null 2>&1 || continue
-
-    "$BIN" -D INPUT   -j REALM_IN  2>/dev/null || true
-    "$BIN" -D OUTPUT  -j REALM_OUT 2>/dev/null || true
-    "$BIN" -D FORWARD -j REALM_OUT 2>/dev/null || true
-
-    "$BIN" -F REALM_IN  2>/dev/null || true
-    "$BIN" -F REALM_OUT 2>/dev/null || true
-    "$BIN" -X REALM_IN  2>/dev/null || true
-    "$BIN" -X REALM_OUT 2>/dev/null || true
-  done
-
-  echo -e "${GREEN}>>> 防火墙残留清理完成${RESET}"
+restart_realm() {
+    systemctl restart realm
+    [[ -f "$PANEL_SERVICE_FILE" ]] && systemctl restart "$PANEL_SERVICE" >/dev/null 2>&1 || true
+    info "Realm 已重启。"
 }
 
 uninstall_realm() {
-  echo -e "${YELLOW}开始卸载 Realm 面板...${RESET}"
-  bash <(curl -fsSL https://raw.githubusercontent.com/hiapb/hia-realm/main/unipan.sh) || true
-
-  cleanup_realm_firewall
-
-  echo -e "${YELLOW}开始卸载 Realm 主程序...${RESET}"
-  systemctl stop realm >/dev/null 2>&1 || true
-  systemctl disable realm >/dev/null 2>&1 || true
-
-  rm -f "$REALM_BIN" "$SERVICE_FILE" "$CONFIG_FILE"
-  rm -f /etc/sysctl.d/99-realm.conf
-
-  rm -f /etc/realm/panel_data.json 2>/dev/null || true
-
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl daemon-reexec >/dev/null 2>&1 || true
-
-  echo -e "${GREEN}Realm 及面板已全部卸载完成。${RESET}"
+    warn "这将卸载 Realm、面板和配置文件。"
+    read -rp "确认卸载？[y/N]: " ans
+    [[ "$ans" =~ ^[Yy]$ ]] || return 0
+    systemctl stop realm realm-panel >/dev/null 2>&1 || true
+    systemctl disable realm realm-panel >/dev/null 2>&1 || true
+    rm -f "$REALM_BIN" "$PANEL_BIN" "$SERVICE_FILE" "$PANEL_SERVICE_FILE"
+    rm -rf "$REALM_DIR"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    info "Realm 已卸载。"
 }
 
+write_panel() {
+    cat > "$PANEL_BIN" <<'PY'
+#!/usr/bin/env python3
+import base64
+import hashlib
+import http.cookies
+import json
+import os
+import re
+import secrets
+import shutil
+import socket
+import ssl
+import subprocess
+import time
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, unquote
 
-RULE_STARTS=()
-RULE_ENDS=()
-RULE_ENABLED=()
-RULE_NAMES=()
-RULE_LISTENS=()
-RULE_REMOTES=()
-RULE_TYPES=()
+CONFIG_FILE = "/etc/realm/config.toml"
+BACKUP_DIR = "/etc/realm/backups"
+PANEL_DATA = "/etc/realm/panel_data.json"
+LOG_FILE = "/var/log/realm-manager.log"
+PANEL_USER = os.environ.get("PANEL_USER", "admin")
+PANEL_PASS = os.environ.get("PANEL_PASS", "123456")
+PANEL_PORT = int(os.environ.get("PANEL_PORT", "4794"))
+PANEL_HOST = os.environ.get("PANEL_HOST", "0.0.0.0")
+PANEL_CERT = os.environ.get("PANEL_CERT", "")
+PANEL_KEY = os.environ.get("PANEL_KEY", "")
+BG_PC = "https://images.unsplash.com/photo-1500530855697-b586d89ba3ee?auto=format&fit=crop&w=2200&q=80"
+BG_MOBILE = "https://images.unsplash.com/photo-1500534314209-a25ddb2bd429?auto=format&fit=crop&w=1200&q=80"
+SESSIONS = {}
 
-get_endpoint_line_numbers_all() {
-  [ -f "$CONFIG_FILE" ] || return 0
-  grep -n -E '^[[:space:]]*(#\s*)?\[\[endpoints\]\]' "$CONFIG_FILE" | cut -d: -f1
+def sh(cmd):
+    return subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+def log(msg):
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(time.strftime("[%F %T] ") + msg + "\n")
+    except OSError:
+        pass
+
+def ensure_dirs():
+    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    if not os.path.exists(CONFIG_FILE):
+        write_rules([])
+
+def valid_port(v):
+    try:
+        p = int(str(v))
+    except ValueError:
+        return False
+    return 1 <= p <= 65535 and str(v) == str(p)
+
+def valid_host_port(v):
+    return bool(re.fullmatch(r"(\[[0-9a-fA-F:]+\]|[A-Za-z0-9_.:-]+):[0-9]{1,5}", v or ""))
+
+def safe_name(v):
+    v = (v or "").replace("\r", " ").replace("\n", " ").replace('"', "").strip()
+    return re.sub(r"[\x00-\x1f\x7f]", "", v)[:60]
+
+def parse_block(block, enabled=True):
+    item = {"enabled": enabled, "name": "", "listen": "", "remote": "", "type": "tcp+udp"}
+    for line in block:
+        raw = line.strip()
+        if raw.startswith("#"):
+            raw = raw[1:].strip()
+        m = re.match(r'(name|listen|remote|type)\s*=\s*"(.*)"', raw)
+        if m:
+            item[m.group(1)] = m.group(2)
+    if item["listen"] == "127.0.0.1:65534" and item["remote"] == "127.0.0.1:65534":
+        return None
+    if item["listen"] and item["remote"]:
+        item["id"] = hashlib.sha1((item["listen"] + "|" + item["remote"] + "|" + item["name"]).encode()).hexdigest()[:12]
+        return item
+    return None
+
+def load_rules():
+    ensure_dirs()
+    rules, block, enabled = [], [], True
+    with open(CONFIG_FILE, encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            stripped = line.strip()
+            marker = stripped == "[[endpoints]]" or stripped == "# [[endpoints]]"
+            if marker:
+                if block:
+                    item = parse_block(block, enabled)
+                    if item:
+                        rules.append(item)
+                block = [line]
+                enabled = stripped == "[[endpoints]]"
+            elif block:
+                block.append(line)
+        if block:
+            item = parse_block(block, enabled)
+            if item:
+                rules.append(item)
+    return rules
+
+def backup_config():
+    if os.path.exists(CONFIG_FILE):
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        shutil.copy2(CONFIG_FILE, os.path.join(BACKUP_DIR, "config.toml." + ts))
+
+def write_rules(rules):
+    ensure_dirs()
+    tmp = CONFIG_FILE + ".tmp.%d" % os.getpid()
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write('[[endpoints]]\nname = "system-keepalive"\nlisten = "127.0.0.1:65534"\nremote = "127.0.0.1:65534"\ntype = "tcp+udp"\n')
+        for r in rules:
+            prefix = "" if r.get("enabled", True) else "# "
+            f.write("\n%s[[endpoints]]\n" % prefix)
+            f.write('%sname = "%s"\n' % (prefix, safe_name(r.get("name"))))
+            f.write('%slisten = "%s"\n' % (prefix, r["listen"]))
+            f.write('%sremote = "%s"\n' % (prefix, r["remote"]))
+            f.write('%stype = "tcp+udp"\n' % prefix)
+    os.replace(tmp, CONFIG_FILE)
+
+def restart_realm():
+    sh(["systemctl", "restart", "realm"])
+
+def normalize_listen(v):
+    v = str(v or "").strip()
+    if valid_port(v):
+        return "0.0.0.0:" + v
+    return v
+
+def test_connect(host_port):
+    hp = str(host_port or "").strip()
+    if hp.startswith("["):
+        m = re.match(r"\[([0-9a-fA-F:]+)\]:(\d+)$", hp)
+        host, port = (m.group(1), int(m.group(2))) if m else ("", 0)
+    else:
+        host, port_s = hp.rsplit(":", 1) if ":" in hp else ("", "0")
+        port = int(port_s) if port_s.isdigit() else 0
+    start = time.monotonic()
+    try:
+        with socket.create_connection((host, port), timeout=4):
+            pass
+        return {"ok": True, "elapsed_ms": int((time.monotonic() - start) * 1000)}
+    except Exception as e:
+        return {"ok": False, "elapsed_ms": int((time.monotonic() - start) * 1000), "error": str(e)}
+
+def check_auth(headers):
+    c = http.cookies.SimpleCookie(headers.get("Cookie", ""))
+    sid = c.get("sid")
+    return bool(sid and sid.value in SESSIONS)
+
+def json_bytes(data):
+    return json.dumps(data, ensure_ascii=False).encode("utf-8")
+
+LOGIN_HTML = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Realm Login</title><style>*{margin:0;padding:0;box-sizing:border-box}body{height:100vh;width:100vw;overflow:hidden;display:flex;justify-content:center;align-items:center;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:url("__BG_PC__") no-repeat center center/cover;color:#374151}@media(max-width:768px){body{background-image:url("__BG_MOBILE__")}}.overlay{position:absolute;inset:0;background:rgba(0,0,0,.05)}.box{position:relative;z-index:2;background:rgba(255,255,255,.3);backdrop-filter:blur(25px);-webkit-backdrop-filter:blur(25px);padding:2.5rem;border-radius:24px;border:1px solid rgba(255,255,255,.4);box-shadow:0 8px 32px rgba(0,0,0,.05);width:90%;max-width:380px;text-align:center}h2{margin-bottom:2rem;font-weight:600;letter-spacing:1px}input{width:100%;padding:14px;margin-bottom:1.2rem;border:1px solid rgba(255,255,255,.5);border-radius:12px;outline:none;background:rgba(255,255,255,.5)}button{width:100%;padding:14px;background:rgba(59,130,246,.85);color:white;border:0;border-radius:12px;cursor:pointer;font-weight:600;font-size:1rem}</style></head><body><div class="overlay"></div><div class="box"><h2>Realm Panel</h2><form method="post" action="/login"><input name="username" placeholder="Username" required><input name="password" type="password" placeholder="Password" required><button>登 录</button></form></div></body></html>'''
+
+DASH_HTML = r'''<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover"><title>Realm Panel</title><style>:root{--primary:#3b82f6;--danger:#f87171;--success:#34d399;--text:#374151}*{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;height:100vh;overflow:hidden;background:url("__BG_PC__") no-repeat center center/cover;display:flex;flex-direction:column;color:var(--text)}@media(max-width:768px){body{background-image:url("__BG_MOBILE__")}}button{border:0;cursor:pointer}.navbar{background:rgba(255,255,255,.3);backdrop-filter:blur(25px);border-bottom:1px solid rgba(255,255,255,.3);padding:.8rem 2rem;display:flex;justify-content:space-between;align-items:center}.brand{font-weight:700}.container{flex:1;display:flex;flex-direction:column;max-width:1180px;margin:1.5rem auto;width:95%;overflow:hidden}.card{background:rgba(255,255,255,.3);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.4);border-radius:18px;box-shadow:0 4px 15px rgba(0,0,0,.03)}.card-fixed{padding:1.2rem;margin-bottom:1.5rem}.card-scroll{flex:1;overflow:hidden;display:flex;flex-direction:column}.grid{display:grid;grid-template-columns:1fr 1fr 1.5fr auto auto;gap:12px}.grid input{padding:12px;border:1px solid rgba(255,255,255,.5);border-radius:12px;background:rgba(255,255,255,.55)}.btn{padding:10px 14px;border-radius:10px;color:white;font-weight:600}.btn-primary{background:var(--primary)}.btn-gray{background:rgba(255,255,255,.55);color:#4b5563}.btn-danger{background:var(--danger)}.btn-green{background:#059669}.table-wrapper{flex:1;overflow:auto;padding:0 1.5rem 1.5rem}table{width:100%;border-collapse:separate;border-spacing:0 10px}th{position:sticky;top:0;background:rgba(255,255,255,.45);backdrop-filter:blur(15px);padding:14px 12px;text-align:left;color:#6b7280;font-size:.85rem}td{background:rgba(255,255,255,.55);padding:12px;vertical-align:middle}tr td:first-child{border-radius:12px 0 0 12px}tr td:last-child{border-radius:0 12px 12px 0}.status{display:inline-flex;align-items:center;gap:7px}.dot{width:9px;height:9px;border-radius:999px;background:#9ca3af}.dot.on{background:var(--success)}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}.ops{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap}.test{font-size:.82rem;font-weight:700;margin-left:6px}.ok{color:#059669}.bad{color:#dc2626}.modal{position:fixed;inset:0;background:rgba(0,0,0,.18);display:none;align-items:center;justify-content:center;z-index:20}.modal-box{background:rgba(255,255,255,.82);backdrop-filter:blur(25px);border-radius:20px;padding:24px;width:92%;max-width:460px}.modal-box input{width:100%;padding:12px;margin:7px 0 14px;border:1px solid rgba(0,0,0,.08);border-radius:10px;background:rgba(255,255,255,.7)}@media(max-width:768px){.grid{grid-template-columns:1fr}.navbar{padding:.8rem 1rem}thead{display:none}tbody tr{display:flex;flex-direction:column;border-radius:18px;margin-bottom:12px;padding:15px;background:rgba(255,255,255,.45)}td{display:flex;justify-content:space-between;gap:12px;background:transparent;padding:7px 0}td:before{content:attr(data-label);color:#8b95a1;font-size:.85rem}.ops{justify-content:flex-end}.nav-text{display:none}}</style></head><body><div class="navbar"><div class="brand">Realm 转发面板</div><div><button class="btn btn-gray" onclick="load()">刷新</button> <button class="btn btn-danger" onclick="logout()">退出</button></div></div><div class="container"><div class="card card-fixed"><div class="grid"><input id="n" placeholder="备注名称"><input id="l" placeholder="监听端口，如 10000"><input id="r" placeholder="目标，如 1.2.3.4:443"><button class="btn btn-primary" onclick="openAdd()">添加</button><button class="btn btn-green" onclick="backup()">导出</button></div></div><div class="card card-scroll"><div style="padding:1.2rem 1.5rem;font-weight:700">转发规则管理</div><div class="table-wrapper"><table><thead><tr><th>状态</th><th>备注</th><th>监听</th><th>目标</th><th>连通性</th><th style="text-align:right">操作</th></tr></thead><tbody id="list"></tbody></table><div id="empty" style="display:none;text-align:center;padding:50px;color:#6b7280">暂无规则</div></div></div></div><div id="modal" class="modal"><div class="modal-box"><h3 id="mt">添加规则</h3><input type="hidden" id="eid"><label>备注</label><input id="mn"><label>监听端口</label><input id="ml"><label>目标地址</label><input id="mr"><div style="margin-top:12px;display:flex;justify-content:flex-end;gap:12px"><button class="btn btn-gray" onclick="closeModal()">取消</button><button class="btn btn-primary" onclick="save()">保存</button></div></div></div><script>let rules=[];const $=id=>document.getElementById(id);function esc(v){return String(v||'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}async function api(u,o){const r=await fetch(u,o);if(r.status===401){location.href='/login';return}const d=await r.json().catch(()=>({}));if(!r.ok)throw new Error(d.error||r.statusText);return d}async function load(){const d=await api('/api/rules');rules=d.rules||[];render()}function render(){const t=$('list');t.innerHTML='';$('empty').style.display=rules.length?'none':'block';rules.forEach(r=>{const tr=document.createElement('tr');tr.innerHTML=`<td data-label="状态"><span class="status"><span class="dot ${r.enabled?'on':''}"></span>${r.enabled?'在线':'暂停'}</span></td><td data-label="备注"><b>${esc(r.name)}</b></td><td data-label="监听" class="mono">${esc(r.listen)}</td><td data-label="目标" class="mono">${esc(r.remote)}</td><td data-label="连通性"><button class="btn btn-gray" onclick="testRule('${r.id}',this)">测试</button><span class="test"></span></td><td data-label="操作"><div class="ops"><button class="btn btn-gray" onclick="tog('${r.id}')">${r.enabled?'暂停':'启动'}</button><button class="btn btn-primary" onclick="openEdit('${r.id}')">编辑</button><button class="btn btn-danger" onclick="delRule('${r.id}')">删除</button></div></td>`;t.appendChild(tr)})}function openAdd(){$('eid').value='';$('mt').textContent='添加规则';$('mn').value=$('n').value;$('ml').value=$('l').value;$('mr').value=$('r').value;$('modal').style.display='flex'}function openEdit(id){const r=rules.find(x=>x.id===id);$('eid').value=id;$('mt').textContent='编辑规则';$('mn').value=r.name;$('ml').value=r.listen.replace('0.0.0.0:','');$('mr').value=r.remote;$('modal').style.display='flex'}function closeModal(){$('modal').style.display='none'}async function save(){const id=$('eid').value;const body={name:$('mn').value,listen:$('ml').value,remote:$('mr').value};await api(id?'/api/rules/'+id:'/api/rules',{method:id?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});closeModal();$('n').value='';$('l').value='';$('r').value='';load()}async function delRule(id){if(confirm('确定删除此规则吗？')){await api('/api/rules/'+id,{method:'DELETE'});load()}}async function tog(id){await api('/api/rules/'+id+'/toggle',{method:'POST'});load()}async function testRule(id,btn){const r=rules.find(x=>x.id===id);const out=btn.parentElement.querySelector('.test');out.textContent='测试中...';out.className='test';const d=await api('/api/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({remote:r.remote})});if(d.ok){out.textContent='可达 '+d.elapsed_ms+'ms';out.className='test ok'}else{out.textContent='失败 '+d.elapsed_ms+'ms';out.className='test bad';alert(d.error||'连接失败')}}async function backup(){window.location.href='/api/backup'}async function logout(){await fetch('/logout',{method:'POST'});location.href='/login'}load();setInterval(load,5000);</script></body></html>'''
+
+class Handler(BaseHTTPRequestHandler):
+    def send_raw(self, code, body, ctype="text/html; charset=utf-8", headers=None):
+        raw = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        if headers:
+            for k, v in headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def send_json(self, data, code=200):
+        self.send_raw(code, json_bytes(data), "application/json; charset=utf-8")
+
+    def body_json(self):
+        n = int(self.headers.get("Content-Length", "0") or "0")
+        return json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+
+    def require(self):
+        if check_auth(self.headers):
+            return True
+        self.send_response(302)
+        self.send_header("Location", "/login")
+        self.end_headers()
+        return False
+
+    def do_GET(self):
+        ensure_dirs()
+        if self.path == "/login":
+            self.send_raw(200, LOGIN_HTML.replace("__BG_PC__", BG_PC).replace("__BG_MOBILE__", BG_MOBILE))
+            return
+        if not self.require():
+            return
+        if self.path == "/":
+            self.send_raw(200, DASH_HTML.replace("__BG_PC__", BG_PC).replace("__BG_MOBILE__", BG_MOBILE))
+        elif self.path == "/api/rules":
+            self.send_json({"rules": load_rules(), "realm": sh(["systemctl", "is-active", "realm"]).stdout.strip()})
+        elif self.path == "/api/backup":
+            self.send_raw(200, json.dumps(load_rules(), ensure_ascii=False, indent=2), "application/json; charset=utf-8", {"Content-Disposition": 'attachment; filename="realm-rules.json"'})
+        else:
+            self.send_json({"error": "not found"}, 404)
+
+    def do_POST(self):
+        ensure_dirs()
+        if self.path == "/login":
+            n = int(self.headers.get("Content-Length", "0") or "0")
+            data = parse_qs(self.rfile.read(n).decode())
+            if data.get("username", [""])[0] == PANEL_USER and data.get("password", [""])[0] == PANEL_PASS:
+                sid = secrets.token_urlsafe(24)
+                SESSIONS[sid] = time.time()
+                self.send_response(302)
+                self.send_header("Set-Cookie", "sid=%s; HttpOnly; SameSite=Lax; Path=/" % sid)
+                self.send_header("Location", "/")
+                self.end_headers()
+            else:
+                self.send_raw(401, "用户名或密码错误")
+            return
+        if self.path == "/logout":
+            self.send_response(302)
+            self.send_header("Set-Cookie", "sid=; Max-Age=0; Path=/")
+            self.send_header("Location", "/login")
+            self.end_headers()
+            return
+        if not self.require():
+            return
+        try:
+            if self.path == "/api/rules":
+                data = self.body_json()
+                rule = {"enabled": True, "name": safe_name(data.get("name")), "listen": normalize_listen(data.get("listen")), "remote": str(data.get("remote", "")).strip(), "type": "tcp+udp"}
+                if not rule["name"] or not valid_host_port(rule["listen"]) or not valid_host_port(rule["remote"]):
+                    raise ValueError("规则格式无效")
+                rules = [r for r in load_rules() if r["listen"] != rule["listen"]]
+                rules.append(rule)
+                backup_config(); write_rules(rules); restart_realm()
+                self.send_json({"status": "ok"})
+            elif self.path == "/api/test":
+                data = self.body_json()
+                self.send_json(test_connect(data.get("remote")))
+            else:
+                parts = self.path.strip("/").split("/")
+                if len(parts) == 4 and parts[:2] == ["api", "rules"] and parts[3] == "toggle":
+                    rid = parts[2]
+                    rules = load_rules()
+                    for r in rules:
+                        if r["id"] == rid:
+                            r["enabled"] = not r.get("enabled", True)
+                            break
+                    backup_config(); write_rules(rules); restart_realm()
+                    self.send_json({"status": "ok"})
+                else:
+                    self.send_json({"error": "not found"}, 404)
+        except Exception as e:
+            self.send_json({"error": str(e)}, 400)
+
+    def do_PUT(self):
+        if not self.require():
+            return
+        try:
+            parts = self.path.strip("/").split("/")
+            if len(parts) == 3 and parts[:2] == ["api", "rules"]:
+                rid = parts[2]
+                data = self.body_json()
+                rules = load_rules()
+                found = False
+                for r in rules:
+                    if r["id"] == rid:
+                        r.update({"name": safe_name(data.get("name")), "listen": normalize_listen(data.get("listen")), "remote": str(data.get("remote", "")).strip(), "type": "tcp+udp"})
+                        found = True
+                        break
+                if not found:
+                    raise ValueError("规则不存在")
+                backup_config(); write_rules(rules); restart_realm()
+                self.send_json({"status": "ok"})
+            else:
+                self.send_json({"error": "not found"}, 404)
+        except Exception as e:
+            self.send_json({"error": str(e)}, 400)
+
+    def do_DELETE(self):
+        if not self.require():
+            return
+        try:
+            parts = self.path.strip("/").split("/")
+            if len(parts) == 3 and parts[:2] == ["api", "rules"]:
+                rid = parts[2]
+                rules = [r for r in load_rules() if r["id"] != rid]
+                backup_config(); write_rules(rules); restart_realm()
+                self.send_json({"status": "ok"})
+            else:
+                self.send_json({"error": "not found"}, 404)
+        except Exception as e:
+            self.send_json({"error": str(e)}, 400)
+
+    def log_message(self, fmt, *args):
+        return
+
+if __name__ == "__main__":
+    ensure_dirs()
+    httpd = ThreadingHTTPServer((PANEL_HOST, PANEL_PORT), Handler)
+    scheme = "http"
+    if PANEL_CERT and PANEL_KEY:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(PANEL_CERT, PANEL_KEY)
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        scheme = "https"
+    print("realm-panel listening on %s://%s:%d" % (scheme, PANEL_HOST, PANEL_PORT), flush=True)
+    httpd.serve_forever()
+PY
+    chmod +x "$PANEL_BIN"
 }
 
-build_rules_index() {
-  RULE_STARTS=()
-  RULE_ENDS=()
-  RULE_ENABLED=()
-  RULE_NAMES=()
-  RULE_LISTENS=()
-  RULE_REMOTES=()
-  RULE_TYPES=()
-  ensure_config_file
-  mapfile -t LINES < <(get_endpoint_line_numbers_all)
-  local n=${#LINES[@]}
-  [ "$n" -eq 0 ] && return 0
-  for ((i=0; i<n; i++)); do
-    local START END BLOCK FIRST ENABLED NAME LISTEN REMOTE TYPE
-    START=${LINES[$i]}
-    END=${LINES[$((i+1))]:-999999}
-    BLOCK="$(sed -n "$START,$((END-1))p" "$CONFIG_FILE")"
-    FIRST="$(echo "$BLOCK" | head -n1)"
-    if echo "$FIRST" | grep -q -E '^[[:space:]]*#'; then ENABLED=0; else ENABLED=1; fi
-    LISTEN="$(echo "$BLOCK" | grep -m1 -E '^[[:space:]]*(#\s*)?listen' | cut -d'"' -f2)"
-    REMOTE="$(echo "$BLOCK" | grep -m1 -E '^[[:space:]]*(#\s*)?remote' | cut -d'"' -f2)"
-    TYPE="$(echo "$BLOCK"   | grep -m1 -E '^[[:space:]]*(#\s*)?type'   | cut -d'"' -f2)"
-    NAME="$(echo "$BLOCK"   | grep -m1 -E '^[[:space:]]*(#\s*)?name'   | cut -d'"' -f2)"
-    [ -z "$LISTEN" ] || [ -z "$REMOTE" ] || [ -z "$TYPE" ] && continue
-    [ "$NAME" == "system-keepalive" ] && continue
-    RULE_STARTS+=("$START")
-    RULE_ENDS+=("$END")
-    RULE_ENABLED+=("$ENABLED")
-    RULE_NAMES+=("${NAME:-未命名}")
-    RULE_LISTENS+=("$LISTEN")
-    RULE_REMOTES+=("$REMOTE")
-    RULE_TYPES+=("$TYPE")
-  done
+get_panel_env() {
+    local key="$1"
+    [[ -f "$PANEL_SERVICE_FILE" ]] || return 0
+    sed -n -E "s|^Environment=\"${key}=([^\"]*)\"$|\\1|p" "$PANEL_SERVICE_FILE" | tail -1
 }
 
-print_rules_pretty() {
-  build_rules_index
-  local COUNT=${#RULE_STARTS[@]}
-  if [ "$COUNT" -eq 0 ]; then
-    echo -e "${YELLOW}暂无转发规则。${RESET}"
+find_acme_sh() {
+    command -v acme.sh 2>/dev/null && return 0
+    [[ -x "$HOME/.acme.sh/acme.sh" ]] && { echo "$HOME/.acme.sh/acme.sh"; return 0; }
+    [[ -x "/root/.acme.sh/acme.sh" ]] && { echo "/root/.acme.sh/acme.sh"; return 0; }
     return 1
-  fi
-  echo -e "${GREEN}当前转发规则：${RESET}"
-  for ((i=0; i<COUNT; i++)); do
-    local st
-    [ "${RULE_ENABLED[$i]}" -eq 1 ] && st="启用" || st="暂停"
-    echo -e "$((i+1)). [${st}] [${RULE_NAMES[$i]}] ${RULE_LISTENS[$i]} -> ${RULE_REMOTES[$i]} (${RULE_TYPES[$i]})"
-  done
-  return 0
 }
 
-escape_toml() { printf "%s" "$1" | awk '{gsub(/\\/,"\\\\"); gsub(/"/,"\\\""); print}'; }
-listen_mode_from_value() { [[ "$1" == \[*\]* ]] && echo "v6" || echo "v4"; }
-get_port_from_listen() { echo "${1##*:}"; }
-replace_listen_port_keep_proto() { echo "${1%:*}:$2"; }
-
-has_ipv6() { command -v ip >/dev/null 2>&1 || return 1; ip -6 addr show 2>/dev/null | awk '/inet6/ && $2 !~ /^::1/ {ok=1} END{exit ok?0:1}'; }
-
-choose_listen_mode_v4v6() {
-  while true; do
-    echo "请选择监听协议：" >&2
-    echo "1. IPv4【默认】" >&2
-    echo "2. IPv6" >&2
-    read -p "请选择 [1-2]（默认 1）: " MODE
-    MODE="${MODE:-1}"
-    case "$MODE" in
-      1) echo "v4"; return 0 ;;
-      2)
-        if has_ipv6; then echo "v6"; return 0
-        else echo -e "${RED}本机无可用 IPv6，请改选 IPv4。${RESET}" >&2
-        fi ;;
-      *) echo -e "${RED}无效选项，请重新选择。${RESET}" >&2 ;;
-    esac
-  done
-}
-
-config_port_conflict() {
-  local mode="$1" port="$2" exclude="${3:-}"
-  build_rules_index
-  local i listen p m
-  for ((i=0; i<${#RULE_LISTENS[@]}; i++)); do
-    [ -n "$exclude" ] && [ "$i" -eq "$exclude" ] && continue
-    listen="${RULE_LISTENS[$i]}"
-    m="$(listen_mode_from_value "$listen")"
-    p="$(get_port_from_listen "$listen")"
-    if [ "$m" = "$mode" ] && [ "$p" = "$port" ]; then return 0; fi
-  done
-  return 1
-}
-
-port_in_use_system() {
-  local port="$1"
-  if command -v ss >/dev/null 2>&1; then
-    ss -H -lntu 2>/dev/null | awk '{print $4}' | awk -v p=":$port" '$0 ~ (p"$") {found=1} END{exit found?0:1}'
-    return $?
-  fi
-  if command -v netstat >/dev/null 2>&1; then
-    netstat -lntu 2>/dev/null | awk '{print $4}' | awk -v p=":$port" '$0 ~ (p"$") {found=1} END{exit found?0:1}'
-    return $?
-  fi
-  return 1
-}
-
-prompt_listen_port_checked() {
-  local mode="$1" exclude="${2:-}" except_port="${3:-}" p=""
-  while true; do
-    read -p "请输入监听端口: " p
-    if ! [[ "$p" =~ ^[0-9]+$ ]] || [ "$p" -lt 1 ] || [ "$p" -gt 65535 ]; then
-      echo -e "${RED}监听端口必须是数字。${RESET}" >&2
-      continue
-    fi
-    if [ -n "$except_port" ] && [ "$p" = "$except_port" ]; then echo "$p"; return 0; fi
-    if config_port_conflict "$mode" "$p" "$exclude"; then
-      echo -e "${RED}端口 $p 已被其它规则占用（配置冲突），请重新输入。${RESET}" >&2
-      continue
-    fi
-    if port_in_use_system "$p"; then
-      echo -e "${YELLOW}提示：系统检测到端口 $p 正在被占用。建议换端口。${RESET}" >&2
-      read -p "仍然使用该端口吗？[y/N]: " ANS
-      case "$ANS" in y|Y) echo "$p"; return 0 ;; *) continue ;; esac
-    fi
-    echo "$p"; return 0
-  done
-}
-
-prompt_remote_by_mode() {
-  local MODE="$1" REMOTE=""
-  while true; do
-    if [ "$MODE" = "v4" ]; then
-      echo -e "${GREEN}远程目标：IPv4/域名:PORT  例：1.2.3.4:443 或 example.com:443${RESET}" >&2
-      read -r -p "请输入远程目标: " REMOTE
-      [ -z "$REMOTE" ] && { echo -e "${RED}远程目标不能为空。${RESET}" >&2; continue; }
-      [[ "$REMOTE" == \[*\]:* ]] && { echo -e "${RED}非 IPv4，请重输。${RESET}" >&2; continue; }
-      [[ "$REMOTE" == *:* && "$REMOTE" != *"."* ]] && { echo -e "${RED} 非 IPv4，请重输。${RESET}" >&2; continue; }
-      echo "$REMOTE"; return 0
+ensure_acme_sh() {
+    local acme
+    acme=$(find_acme_sh 2>/dev/null || true)
+    [[ -n "$acme" ]] && { echo "$acme"; return 0; }
+    install_base_deps
+    read -rp "Let's Encrypt 账号邮箱 [可留空]: " email
+    if [[ -n "$email" ]]; then
+        curl -fsSL https://get.acme.sh | sh -s "email=${email}" >/dev/null
     else
-      echo -e "${GREEN}远程目标：[IPv6]:PORT  例：[2001:db8::1]:443${RESET}" >&2
-      read -r -p "请输入远程目标: " REMOTE
-      [ -z "$REMOTE" ] && { echo -e "${RED}远程目标不能为空。${RESET}" >&2; continue; }
-      echo "$REMOTE" | awk '$0 ~ /^\[[0-9A-Fa-f:]+\]:[0-9]+$/ {ok=1} END{exit ok?0:1}' || { echo -e "${RED}IPv6 格式必须是 [IPv6]:PORT，请重输。${RESET}" >&2; continue; }
-      echo "$REMOTE"; return 0
+        curl -fsSL https://get.acme.sh | sh >/dev/null
     fi
-  done
+    find_acme_sh
 }
 
-apply_block_key_update() {
-  local start="$1" end="$2" enabled="$3" key="$4" value="$5" tmp="${CONFIG_FILE}.tmp.$$" prefix=""
-  [ "$enabled" -eq 0 ] && prefix="# "
-  awk -v S="$start" -v E="$end" -v K="$key" -v V="$value" -v PFX="$prefix" '
-    function is_key_line(line, key) { return line ~ "^[[:space:]]*(#[[:space:]]*)?" key "[[:space:]]*=" }
-    BEGIN{found=0}
-    {
-      if (NR>=S && NR<=E-1) {
-        if (!found && is_key_line($0, K)) { print PFX K " = \"" V "\""; found=1; next }
-      }
-      print $0
-      if (NR>=S && NR<=E-1 && $0 ~ "^[[:space:]]*$" && !found) { print PFX K " = \"" V "\""; found=1 }
-    }
-  ' "$CONFIG_FILE" > "$tmp"
-  mv "$tmp" "$CONFIG_FILE"
+issue_ip_cert() {
+    local cert_ip="$1" cert_path="$2" key_path="$3" acme
+    acme=$(ensure_acme_sh)
+    "$acme" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+    "$acme" --issue --server letsencrypt --standalone -d "$cert_ip" --certificate-profile shortlived --days 3 --force
+    mkdir -p "$(dirname "$cert_path")" "$(dirname "$key_path")"
+    "$acme" --install-cert -d "$cert_ip" --key-file "$key_path" --fullchain-file "$cert_path" --reloadcmd "systemctl restart ${PANEL_SERVICE}"
+    "$acme" --install-cronjob >/dev/null 2>&1 || true
+    chmod 600 "$key_path" 2>/dev/null || true
 }
 
-add_rule() {
-  ensure_config_file
-  local MODE NAME LISTEN REMOTE
-  MODE="$(choose_listen_mode_v4v6)"
-  while true; do
-    read -p "请输入规则名称: " NAME
-    if validate_name "$NAME"; then break; fi
-    echo -e "${RED}名称不合法：仅允许 中文/字母/数字/_/-，长度 1-50。${RESET}"
-  done
-  LISTEN="$(prompt_listen_port_checked "$MODE" "" "")"
-  REMOTE="$(prompt_remote_by_mode "$MODE")"
-  local NAME_ESC REMOTE_ESC LISTEN_ADDR
-  NAME_ESC="$(escape_toml "$NAME")"
-  REMOTE_ESC="$(escape_toml "$REMOTE")"
-  [ "$MODE" = "v6" ] && LISTEN_ADDR="[::]:$LISTEN" || LISTEN_ADDR="0.0.0.0:$LISTEN"
-  cat >> "$CONFIG_FILE" <<EOF
+install_panel() {
+    check_root
+    install_base_deps
+    need_cmd python3
+    local port user pass host cert key existing ip scheme
+    existing=0
+    [[ -f "$PANEL_SERVICE_FILE" ]] && existing=1
+    if (( existing )); then
+        port=$(get_panel_env PANEL_PORT); user=$(get_panel_env PANEL_USER); pass=$(get_panel_env PANEL_PASS)
+        host=$(get_panel_env PANEL_HOST); cert=$(get_panel_env PANEL_CERT); key=$(get_panel_env PANEL_KEY)
+        port="${port:-$PANEL_PORT_DEFAULT}"; user="${user:-$PANEL_USER_DEFAULT}"; pass="${pass:-$PANEL_PASS_DEFAULT}"
+        host="${host:-0.0.0.0}"; cert="${cert:-}"; key="${key:-}"
+        if [[ -z "$cert" && -z "$key" && -f "$PANEL_CERT_DEFAULT" && -f "$PANEL_KEY_DEFAULT" ]]; then
+            cert="$PANEL_CERT_DEFAULT"; key="$PANEL_KEY_DEFAULT"; info "检测到默认路径证书，已自动恢复 HTTPS。"
+        fi
+        info "检测到已安装面板，本次仅更新面板程序并保留配置。"
+    else
+        read -rp "面板端口 [默认 ${PANEL_PORT_DEFAULT}]: " port; port="${port:-$PANEL_PORT_DEFAULT}"
+        validate_port "$port" || { err "端口无效。"; return 1; }
+        read -rp "面板用户名 [默认 ${PANEL_USER_DEFAULT}]: " user; user="${user:-$PANEL_USER_DEFAULT}"
+        read -rsp "面板密码 [默认 ${PANEL_PASS_DEFAULT}]: " pass; echo ""; pass="${pass:-$PANEL_PASS_DEFAULT}"
+        host="0.0.0.0"; cert=""; key=""
+    fi
+    write_panel
+    cat > "$PANEL_SERVICE_FILE" <<EOF
+[Unit]
+Description=Realm Panel
+After=network-online.target realm.service
+Wants=network-online.target
 
-[[endpoints]]
-name   = "$NAME_ESC"
-listen = "$LISTEN_ADDR"
-remote = "$REMOTE_ESC"
-type   = "tcp+udp"
+[Service]
+User=root
+Environment="PANEL_USER=${user}"
+Environment="PANEL_PASS=${pass}"
+Environment="PANEL_PORT=${port}"
+Environment="PANEL_HOST=${host}"
+Environment="PANEL_CERT=${cert}"
+Environment="PANEL_KEY=${key}"
+ExecStart=${PANEL_BIN}
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
 EOF
-  restart_realm_silent
-  echo -e "${GREEN}已添加规则 [$NAME] 并已应用。${RESET}"
+    systemctl daemon-reload
+    systemctl enable "$PANEL_SERVICE" >/dev/null 2>&1 || true
+    systemctl restart "$PANEL_SERVICE"
+    ip=$(get_local_ip)
+    scheme=http; [[ -n "$cert" && -n "$key" ]] && scheme=https
+    info "Realm 面板已安装/更新。"
+    echo "访问地址: ${scheme}://${ip}:${port}"
+    echo "用户名: ${user}"
+    echo "密码: ${pass}"
 }
 
-delete_rule() {
-  if ! print_rules_pretty; then return; fi
-  local COUNT=${#RULE_STARTS[@]}
-  read -p "请输入要删除的规则编号: " IDX
-  IDX=$((IDX-1))
-  if [ "$IDX" -lt 0 ] || [ "$IDX" -ge "$COUNT" ]; then echo -e "${RED}编号无效。${RESET}"; return; fi
-  local START END tmp
-  START=${RULE_STARTS[$IDX]}
-  END=${RULE_ENDS[$IDX]}
-  tmp="${CONFIG_FILE}.tmp.$$"
-  awk -v S="$START" -v E="$END" 'NR<S || NR>=E {print}' "$CONFIG_FILE" > "$tmp"
-  mv "$tmp" "$CONFIG_FILE"
-  restart_realm_silent
-  echo -e "${GREEN}规则已删除并已应用。${RESET}"
+configure_panel_tls() {
+    [[ -f "$PANEL_SERVICE_FILE" ]] || { err "面板尚未安装。"; return 1; }
+    local host cert key cert_ip port
+    read -rp "监听 IP [默认 0.0.0.0]: " host; host="${host:-0.0.0.0}"
+    read -rp "证书文件路径 [默认 ${PANEL_CERT_DEFAULT}]: " cert; cert="${cert:-$PANEL_CERT_DEFAULT}"
+    read -rp "私钥文件路径 [默认 ${PANEL_KEY_DEFAULT}]: " key; key="${key:-$PANEL_KEY_DEFAULT}"
+    if [[ "$cert" == "none" && "$key" == "none" ]]; then cert=""; key=""; fi
+    if [[ -n "$cert" || -n "$key" ]]; then
+        [[ -n "$cert" && -n "$key" ]] || { err "证书和私钥必须同时填写。"; return 1; }
+        mkdir -p "$(dirname "$cert")" "$(dirname "$key")"
+        if [[ ! -f "$cert" || ! -f "$key" ]]; then
+            read -rp "证书 IP [服务器公网 IPv4]: " cert_ip
+            validate_public_ipv4 "$cert_ip" || { err "只能申请公网 IPv4 证书。"; return 1; }
+            issue_ip_cert "$cert_ip" "$cert" "$key"
+        fi
+    fi
+    sed -i -E "s|Environment=\"PANEL_HOST=.*\"|Environment=\"PANEL_HOST=${host}\"|" "$PANEL_SERVICE_FILE"
+    sed -i -E "s|Environment=\"PANEL_CERT=.*\"|Environment=\"PANEL_CERT=${cert}\"|" "$PANEL_SERVICE_FILE"
+    sed -i -E "s|Environment=\"PANEL_KEY=.*\"|Environment=\"PANEL_KEY=${key}\"|" "$PANEL_SERVICE_FILE"
+    systemctl daemon-reload
+    systemctl restart "$PANEL_SERVICE"
+    port=$(get_panel_env PANEL_PORT); port="${port:-$PANEL_PORT_DEFAULT}"
+    info "面板 TLS 配置已更新。"
+    echo "访问地址: $([[ -n "$cert" && -n "$key" ]] && echo https || echo http)://$(get_local_ip):${port}"
 }
 
-clear_rules() {
-  ensure_config_file
-  local tmp="${CONFIG_FILE}.tmp.$$"
-  awk 'BEGIN{drop=0} /^[[:space:]]*(# *|)?\[\[endpoints\]\]/{drop=1; next} drop==1 && /^[[:space:]]*$/{drop=0; next} drop==0{print}' "$CONFIG_FILE" > "$tmp"
-  mv "$tmp" "$CONFIG_FILE"
-  restart_realm_silent
-  echo -e "${GREEN}已清空所有规则并已应用。${RESET}"
-}
-
-list_rules() { print_rules_pretty || true; }
-
-edit_rule() {
-  if ! print_rules_pretty; then return; fi
-  local COUNT=${#RULE_STARTS[@]}
-  read -p "请输入要修改的规则编号: " IDX
-  IDX=$((IDX-1))
-  if [ "$IDX" -lt 0 ] || [ "$IDX" -ge "$COUNT" ]; then echo -e "${RED}编号无效。${RESET}"; return; fi
-  local START END ENABLED CUR_LISTEN CUR_MODE CUR_PORT
-  START=${RULE_STARTS[$IDX]}
-  END=${RULE_ENDS[$IDX]}
-  ENABLED=${RULE_ENABLED[$IDX]}
-  CUR_LISTEN="${RULE_LISTENS[$IDX]}"
-  CUR_MODE="$(listen_mode_from_value "$CUR_LISTEN")"
-  CUR_PORT="$(get_port_from_listen "$CUR_LISTEN")"
-  echo -e "${GREEN}选中规则：${RESET}$((IDX+1)). [${RULE_NAMES[$IDX]}] ${RULE_LISTENS[$IDX]} -> ${RULE_REMOTES[$IDX]} (${RULE_TYPES[$IDX]})"
-  echo "要修改哪个字段？"
-  echo "1. 名称"
-  echo "2. 监听端口"
-  echo "3. 远程目标:端口"
-  echo "0. 返回"
-  read -p "请选择 [0-3]: " OPT
-  case "$OPT" in
-    1)
-      local NEW
-      while true; do
-        read -p "请输入新名称: " NEW
-        if validate_name "$NEW"; then break; fi
-        echo -e "${RED}名称不合法：仅允许 中文/字母/数字/_/-，长度 1-50。${RESET}"
-      done
-      apply_block_key_update "$START" "$END" "$ENABLED" "name" "$(escape_toml "$NEW")"
-      ;;
-    2)
-      local NEWP NEW_LISTEN
-      NEWP="$(prompt_listen_port_checked "$CUR_MODE" "$IDX" "$CUR_PORT")"
-      NEW_LISTEN="$(replace_listen_port_keep_proto "$CUR_LISTEN" "$NEWP")"
-      apply_block_key_update "$START" "$END" "$ENABLED" "listen" "$NEW_LISTEN"
-      ;;
-    3)
-      local NEWR
-      NEWR="$(prompt_remote_by_mode "$CUR_MODE")"
-      apply_block_key_update "$START" "$END" "$ENABLED" "remote" "$(escape_toml "$NEWR")"
-      ;;
-    0) return ;;
-    *) echo -e "${RED}无效选项。${RESET}"; return ;;
-  esac
-  restart_realm_silent
-  echo -e "${GREEN}规则已修改并已应用。${RESET}"
-}
-
-toggle_rule() {
-  if ! print_rules_pretty; then return; fi
-  local COUNT=${#RULE_STARTS[@]}
-  read -p "请输入要启动/暂停的规则编号: " IDX
-  IDX=$((IDX-1))
-  if [ "$IDX" -lt 0 ] || [ "$IDX" -ge "$COUNT" ]; then echo -e "${RED}编号无效。${RESET}"; return; fi
-  local START END tmp
-  START=${RULE_STARTS[$IDX]}
-  END=${RULE_ENDS[$IDX]}
-  tmp="${CONFIG_FILE}.tmp.$$"
-  if [ "${RULE_ENABLED[$IDX]}" -eq 1 ]; then
-    awk -v S="$START" -v E="$END" 'NR>=S && NR<=E-1 { sub(/^[[:space:]]*#?[[:space:]]*/, "# "); print; next } {print}' "$CONFIG_FILE" > "$tmp"
-    mv "$tmp" "$CONFIG_FILE"
-    restart_realm_silent
-    echo -e "${GREEN}已暂停规则：${RULE_NAMES[$IDX]}${RESET}"
-  else
-    awk -v S="$START" -v E="$END" 'NR>=S && NR<=E-1 { sub(/^[[:space:]]*#[[:space:]]*/, ""); print; next } {print}' "$CONFIG_FILE" > "$tmp"
-    mv "$tmp" "$CONFIG_FILE"
-    restart_realm_silent
-    echo -e "${GREEN}已启动规则：${RULE_NAMES[$IDX]}${RESET}"
-  fi
-}
-
-export_rules() {
-  ensure_config_file
-  mkdir -p "$BACKUP_DIR"
-  read -p "导出文件路径 [默认 ${DEFAULT_EXPORT_FILE}]: " OUT
-  OUT="${OUT:-$DEFAULT_EXPORT_FILE}"
-  echo -e "${GREEN}正在打包配置与面板数据...${RESET}"
-  local FILES_TO_BACKUP="config.toml"
-  if [ -f "$PANEL_DATA_FILE" ]; then
-      FILES_TO_BACKUP="config.toml panel_data.json"
-  fi
-  tar -czf "$OUT" -C "$(dirname "$CONFIG_FILE")" $FILES_TO_BACKUP
-  if [ -s "$OUT" ]; then
-    echo -e "${GREEN}导出完成！${RESET}"
-    echo -e "${GREEN}导出文件路径：$OUT${RESET}"
-  else
-    echo -e "${RED}导出失败。${RESET}"
-  fi
-}
-
-import_rules() {
-  ensure_config_file
-  read -p "请输入要导入的文件路径（回车默认：${DEFAULT_IMPORT_FILE}）: " IN
-  IN="${IN:-$DEFAULT_IMPORT_FILE}"
-  if [ -z "$IN" ] || [ ! -f "$IN" ]; then echo -e "${RED}导入文件不存在：$IN${RESET}"; return; fi
-  echo -e "${YELLOW}警告：这将覆盖当前的 规则配置 和 面板数据！${RESET}"
-  read -p "确认覆盖导入吗？[y/N]: " ANS
-  case "$ANS" in y|Y) ;; *) return ;; esac
-  if [[ "$IN" == *.tar.gz ]]; then
-      echo -e "${GREEN}正在恢复全量备份...${RESET}"
-      tar -xzf "$IN" -C "$(dirname "$CONFIG_FILE")"
-  else
-      echo -e "${YELLOW}检测到旧版配置，仅恢复规则。${RESET}"
-      cat "$IN" > "$CONFIG_FILE"
-  fi
-  restart_realm_silent
-  echo -e "${GREEN}导入完成并已应用。${RESET}"
-}
-
-has_cron() {
-  command -v crontab >/dev/null 2>&1 && return 0
-  command -v cron >/dev/null 2>&1 && return 0
-  command -v crond >/dev/null 2>&1 && return 0
-  return 1
-}
-
-install_cron() {
-  echo -e "${YELLOW}系统未检测到 cron/crond。${RESET}"
-  read -p "是否尝试自动安装 cron？[y/N]: " ANS
-  case "$ANS" in y|Y) ;; *) return 1 ;; esac
-  if [ -f /etc/alpine-release ]; then
-    need_cmd apk; apk add --no-cache cronie || return 1
-    rc-update add crond default >/dev/null 2>&1 || true; rc-service crond start >/dev/null 2>&1 || true; return 0
-  fi
-  if [ -f /etc/debian_version ]; then
-    need_cmd apt; apt update && apt install -y cron || return 1
-    systemctl enable cron >/dev/null 2>&1 || true; systemctl start cron >/dev/null 2>&1 || true; return 0
-  fi
-  if [ -f /etc/redhat-release ]; then
-    if command -v dnf >/dev/null 2>&1; then dnf install -y cronie || return 1; else need_cmd yum; yum install -y cronie || return 1; fi
-    systemctl enable crond >/dev/null 2>&1 || true; systemctl start crond >/dev/null 2>&1 || true; return 0
-  fi
-  echo -e "${RED}无法识别发行版，请手动安装 cron/cronie。${RESET}"
-  return 1
-}
-
-ensure_cron_ready() {
-  if has_cron; then return 0; fi
-  install_cron || { echo -e "${RED}cron 不可用，无法创建定时任务。${RESET}"; return 1; }
-  has_cron || { echo -e "${RED}cron 安装/启动失败，无法创建定时任务。${RESET}"; return 1; }
-  return 0
-}
-
-write_export_helper() {
-  mkdir -p "$BACKUP_DIR"
-  cat > "$EXPORT_HELPER" <<EOF
-#!/bin/bash
-set -e
-CONFIG_DIR="/etc/realm"
-BACKUP_DIR="/etc/realm/backups"
-mkdir -p "\$BACKUP_DIR"
-ts="\$(date +%F_%H%M%S)"
-OUT="\$BACKUP_DIR/realm-backup.\${ts}.tar.gz"
-if [ -f "\$CONFIG_DIR/panel_data.json" ]; then
-    tar -czf "\$OUT" -C "\$CONFIG_DIR" config.toml panel_data.json 2>/dev/null
-else
-    tar -czf "\$OUT" -C "\$CONFIG_DIR" config.toml 2>/dev/null
-fi
-ls -tp "\$BACKUP_DIR"/realm-backup.*.tar.gz 2>/dev/null | tail -n +8 | xargs -I {} rm -- "{}"
-EOF
-  chmod +x "$EXPORT_HELPER"
-}
-
-schedule_status() {
-  if [ -f "$CRON_FILE" ] && [ -x "$EXPORT_HELPER" ]; then
-    echo -e "${GREEN}定时备份：已启用${RESET}"
-    echo -e "${GREEN}Cron 文件：$CRON_FILE${RESET}"
-    echo "Cron 内容："
-    cat "$CRON_FILE"
-  else
-    echo -e "${YELLOW}定时备份：未启用${RESET}"
-  fi
-}
-
-normalize_hhmm() {
-  local x="$1"
-  x="${x#0}"; [ -z "$x" ] && x="0"
-  echo "$x"
-}
-
-setup_export_cron() {
-  ensure_cron_ready || return
-  write_export_helper
-  echo "定时导出类型："
-  echo "1. 每天"
-  echo "2. 每周"
-  read -p "请选择 [1-2]: " T
-  local D="*"
-  if [ "$T" = "2" ]; then
-    echo "请选择周几：1=周一 ... 6=周六 7=周日"
-    read -p "周几 [1-7]: " WD
-    case "$WD" in
-      1) D="1" ;;
-      2) D="2" ;;
-      3) D="3" ;;
-      4) D="4" ;;
-      5) D="5" ;;
-      6) D="6" ;;
-      7) D="0" ;;
-      *) echo -e "${RED}周几输入无效。${RESET}"; return ;;
-    esac
-  elif [ "$T" != "1" ]; then
-    echo -e "${RED}无效选项。${RESET}"
-    return
-  fi
-  read -p "请输入小时（0-23，可输入 05）: " HH
-  read -p "请输入分钟（0-59，可输入 00）: " MM
-  HH="$(normalize_hhmm "$HH")"
-  MM="$(normalize_hhmm "$MM")"
-  if ! [[ "$HH" =~ ^[0-9]+$ ]] || [ "$HH" -lt 0 ] || [ "$HH" -gt 23 ]; then
-    echo -e "${RED}小时无效。${RESET}"
-    return
-  fi
-  if ! [[ "$MM" =~ ^[0-9]+$ ]] || [ "$MM" -lt 0 ] || [ "$MM" -gt 59 ]; then
-    echo -e "${RED}分钟无效。${RESET}"
-    return
-  fi
-  cat > "$CRON_FILE" <<EOF
-# Auto export realm rules (generated)
-SHELL=/bin/bash
-PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
-$MM $HH * * $D root $EXPORT_HELPER >/dev/null 2>&1
-EOF
-  echo -e "${GREEN}已添加定时备份任务。${RESET}"
-  echo -e "${GREEN}Cron 文件：$CRON_FILE${RESET}"
-}
-
-remove_export_cron() {
-  local removed=0
-  [ -f "$CRON_FILE" ] && rm -f "$CRON_FILE" && removed=1
-  [ -f "$EXPORT_HELPER" ] && rm -f "$EXPORT_HELPER" && removed=1
-  if [ "$removed" -eq 1 ]; then
-    echo -e "${GREEN}已删除定时备份任务（及导出脚本）。${RESET}"
-  else
-    echo -e "${YELLOW}未发现定时备份任务，无需删除。${RESET}"
-  fi
-}
-
-manage_schedule_backup() {
-  echo "--------------------"
-  echo "定时备份任务管理："
-  echo "1. 查看当前状态"
-  echo "2. 添加定时备份任务"
-  echo "3. 删除定时备份任务"
-  echo "0. 返回"
-  read -p "请选择 [0-3]: " X
-  case "$X" in
-    1) schedule_status ;;
-    2) setup_export_cron ;;
-    3) remove_export_cron ;;
-    0) return ;;
-    *) echo -e "${RED}无效选项。${RESET}" ;;
-  esac
-}
-
-install_ftp(){
-    clear
-    echo -e "${GREEN}📂 FTP/SFTP 备份工具...${RESET}"
-    echo -e "${YELLOW}默认 Realm 规则备份文件：${DEFAULT_EXPORT_FILE}${RESET}"
-    bash <(curl -L https://raw.githubusercontent.com/hiapb/ftp/main/back.sh)
-    sleep 2
-    exit 0
+update_panel_login() {
+    [[ -f "$PANEL_SERVICE_FILE" ]] || { err "面板尚未安装。"; return 1; }
+    local user pass
+    read -rp "新的面板用户名: " user
+    read -rsp "新的面板密码: " pass; echo ""
+    [[ -n "$user" && -n "$pass" ]] || { err "用户名和密码不能为空。"; return 1; }
+    sed -i -E "s|Environment=\"PANEL_USER=.*\"|Environment=\"PANEL_USER=${user}\"|" "$PANEL_SERVICE_FILE"
+    sed -i -E "s|Environment=\"PANEL_PASS=.*\"|Environment=\"PANEL_PASS=${pass}\"|" "$PANEL_SERVICE_FILE"
+    systemctl daemon-reload
+    systemctl restart "$PANEL_SERVICE"
+    echo "用户名: ${user}"
+    echo "密码: ${pass}"
 }
 
 update_panel_port() {
-    if [ ! -f "/etc/systemd/system/realm-panel.service" ]; then
-        echo -e "${RED}检测到面板尚未安装，请先安装面板！${RESET}"
-        return
-    fi
-    echo -e "--------------------"
-    echo -e "${GREEN}修改 Web 面板访问端口${RESET}"
-    read -p "请输入新的端口号 (1-65535): " new_port
-    if ! [[ "$new_port" =~ ^[0-9]+$ ]] || [ "$new_port" -lt 1 ] || [ "$new_port" -gt 65535 ]; then
-        echo -e "${RED}输入无效，端口必须是 1 到 65535 之间的数字。${RESET}"
-        return
-    fi
-    if command -v ss >/dev/null 2>&1; then
-        if ss -lntu | grep -q ":${new_port} "; then
-            echo -e "${RED}错误：端口 $new_port 似乎已被系统其他程序占用。${RESET}"
-            return
-        fi
-    fi
-    echo -e "${YELLOW}正在更新配置...${RESET}"
-    sed -i "s|Environment=\"PANEL_PORT=.*\"|Environment=\"PANEL_PORT=$new_port\"|g" /etc/systemd/system/realm-panel.service
+    [[ -f "$PANEL_SERVICE_FILE" ]] || { err "面板尚未安装。"; return 1; }
+    local port
+    read -rp "新的面板端口: " port
+    validate_port "$port" || { err "端口无效。"; return 1; }
+    sed -i -E "s|Environment=\"PANEL_PORT=.*\"|Environment=\"PANEL_PORT=${port}\"|" "$PANEL_SERVICE_FILE"
     systemctl daemon-reload
-    if systemctl restart realm-panel; then
-        local IP
-        IP=$(curl -s4 ifconfig.me || hostname -I | awk '{print $1}')
-        echo -e "${GREEN}✅ 端口修改成功！${RESET}"
-        echo -e "新的访问地址: ${YELLOW}http://${IP}:${new_port}${RESET}"
-    else
-        echo -e "${RED}修改失败，面板服务无法重启，请检查日志。${RESET}"
-    fi
+    systemctl restart "$PANEL_SERVICE"
+    info "面板端口已更新为 ${port}。"
 }
 
-manage_panel() {
-    echo "--------------------"
-    echo "Realm 面板管理："
-    echo "1. 安装面板"
-    echo "2. 卸载面板"
-    echo "3. 修改面板端口" 
-    echo "0. 返回"
-    read -p "请选择 [0-2]: " PAN_OPT
-    case "$PAN_OPT" in
-        1)
-            echo "--------------------"
-            echo "选择安装方式："
-            echo "1. 快速安装部署"
-            echo "2. 自编译部署"
-            echo "0. 返回"
-            read -p "请选择 [0-2]: " INST_OPT
-            case "$INST_OPT" in
-                1) bash <(curl -fsSL https://raw.githubusercontent.com/hiapb/hia-realm/main/quickpanel.sh) ;;
-                2) bash <(curl -fsSL https://raw.githubusercontent.com/hiapb/hia-realm/main/panel.sh) ;;
-                *) return ;;
-            esac
-            ;;
-        2)
-            bash <(curl -fsSL https://raw.githubusercontent.com/hiapb/hia-realm/main/unipan.sh)
-            ;;
-        3) update_panel_port ;;
-        *) return ;;
-    esac
+uninstall_panel() {
+    systemctl stop "$PANEL_SERVICE" >/dev/null 2>&1 || true
+    systemctl disable "$PANEL_SERVICE" >/dev/null 2>&1 || true
+    rm -f "$PANEL_SERVICE_FILE" "$PANEL_BIN"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    info "Realm 面板已卸载。"
+}
+
+list_rules_cli() {
+    ensure_config_file
+    python3 - "$CONFIG_FILE" <<'PY'
+import re, sys
+path=sys.argv[1]
+rules=[]; block=[]; enabled=True
+def emit(b,en):
+    d={}
+    for line in b:
+        raw=line.strip()
+        if raw.startswith('#'): raw=raw[1:].strip()
+        m=re.match(r'(name|listen|remote|type)\s*=\s*"(.*)"', raw)
+        if m: d[m.group(1)]=m.group(2)
+    if d.get('listen') != '127.0.0.1:65534' and d.get('listen'):
+        rules.append((en,d))
+for line in open(path,encoding='utf-8',errors='ignore'):
+    s=line.strip()
+    if s in ('[[endpoints]]','# [[endpoints]]'):
+        if block: emit(block,enabled)
+        block=[line]; enabled=s=='[[endpoints]]'
+    elif block: block.append(line)
+if block: emit(block,enabled)
+if not rules:
+    print('暂无规则')
+else:
+    for i,(en,r) in enumerate(rules,1):
+        print(f"{i}. [{'启用' if en else '暂停'}] {r.get('name','')} | {r.get('listen','')} -> {r.get('remote','')}")
+PY
+}
+
+add_rule_cli() {
+    ensure_config_file
+    local name port remote listen
+    read -rp "规则名称: " name; name=$(sanitize_name "$name")
+    read -rp "监听端口: " port; validate_port "$port" || { err "端口无效。"; return 1; }
+    read -rp "目标地址 host:port: " remote
+    [[ "$remote" == *:* ]] || { err "目标格式应为 host:port"; return 1; }
+    listen="0.0.0.0:${port}"
+    backup_config
+    cat >> "$CONFIG_FILE" <<EOF
+
+[[endpoints]]
+name = "${name}"
+listen = "${listen}"
+remote = "${remote}"
+type = "tcp+udp"
+EOF
+    restart_realm
+    info "规则已添加。"
+}
+
+export_rules() {
+    ensure_config_file
+    local out
+    read -rp "导出文件路径 [默认 ${BACKUP_DIR}/realm-backup.tar.gz]: " out
+    out="${out:-${BACKUP_DIR}/realm-backup.tar.gz}"
+    mkdir -p "$(dirname "$out")"
+    tar -czf "$out" -C "$REALM_DIR" config.toml 2>/dev/null
+    info "导出完成: ${out}"
+}
+
+import_rules() {
+    local in
+    read -rp "导入文件路径: " in
+    [[ -f "$in" ]] || { err "文件不存在。"; return 1; }
+    backup_config
+    if [[ "$in" == *.tar.gz ]]; then
+        tar -xzf "$in" -C "$REALM_DIR"
+    else
+        cp "$in" "$CONFIG_FILE"
+    fi
+    restart_realm
+    info "导入完成。"
+}
+
+panel_menu() {
+    while true; do
+        echo ""
+        echo "Realm 面板管理"
+        echo "1. 安装/更新面板（保留原风格和已有配置）"
+        echo "2. 卸载面板"
+        echo "3. 修改面板端口"
+        echo "4. 修改登录信息"
+        echo "5. 配置监听 IP / HTTPS IP 证书"
+        echo "6. 查看面板状态"
+        echo "0. 返回"
+        read -rp "请选择 [0-6]: " opt
+        case "$opt" in
+            1) install_panel ;;
+            2) uninstall_panel ;;
+            3) update_panel_port ;;
+            4) update_panel_login ;;
+            5) configure_panel_tls ;;
+            6) systemctl status "$PANEL_SERVICE" --no-pager || true ;;
+            0) return ;;
+            *) err "无效选项。" ;;
+        esac
+    done
 }
 
 main_menu() {
-  check_root
-  while true; do
-    echo -e "${GREEN}===== Realm TCP+UDP 转发脚本 =====${RESET}"
-    get_status_line
-    echo "----------------------------------"
-    echo "1.  安装 Realm"
-    echo "2.  卸载 Realm"
-    echo "3.  重启 Realm"
-    echo "--------------------"
-    echo "4.  添加转发规则"
-    echo "5.  删除单条规则"
-    echo "6.  删除全部规则"
-    echo "7.  查看当前规则"
-    echo "8.  修改某条规则"
-    echo "9.  启动/暂停某条规则"
-    echo "--------------------"
-    echo "10. 查看日志"
-    echo "11. 查看配置"
-    echo "12. 一键导出所有规则"
-    echo "13. 一键导入所有规则"
-    echo "14. 添加/删除定时备份任务"
-    echo "15. 自动备份到FTP/SFTP"
-    echo "16. Realm 面板管理" 
-    echo "0.  退出"
-    read -p "请选择一个操作 [0-15]: " OPT
-    case "$OPT" in
-      1) install_realm ;;
-      2) uninstall_realm ;;
-      0) exit 0 ;;
-      3) require_installed && restart_realm_verbose ;;
-      4) require_installed && add_rule ;;
-      5) require_installed && delete_rule ;;
-      6) require_installed && clear_rules ;;
-      7) require_installed && list_rules ;;
-      8) require_installed && edit_rule ;;
-      9) require_installed && toggle_rule ;;
-      10) require_installed && journalctl -u realm --no-pager --since "1 hour ago" ;;
-      11) require_installed && cat "$CONFIG_FILE" ;;
-      12) require_installed && export_rules ;;
-      13) require_installed && import_rules ;;
-      14) require_installed && manage_schedule_backup ;;
-      15) require_installed && install_ftp ;;
-      16) manage_panel ;;  
-      *) echo -e "${RED}无效选项。${RESET}" ;;
-    esac
-  done
+    check_root
+    while true; do
+        echo ""
+        echo -e "${GREEN}===== Realm TCP+UDP 转发管理 =====${RESET}"
+        if is_installed; then
+            echo "Realm: $(systemctl is-active realm 2>/dev/null || true)  版本: $(get_realm_version)"
+        else
+            echo "Realm: 未安装"
+        fi
+        echo "1. 安装/更新 Realm"
+        echo "2. 卸载 Realm"
+        echo "3. 重启 Realm"
+        echo "4. 添加转发规则"
+        echo "5. 查看当前规则"
+        echo "6. 导出规则"
+        echo "7. 导入规则"
+        echo "8. Realm 面板管理"
+        echo "9. 查看日志"
+        echo "0. 退出"
+        read -rp "请选择 [0-9]: " opt
+        case "$opt" in
+            1) install_realm ;;
+            2) uninstall_realm ;;
+            3) restart_realm ;;
+            4) add_rule_cli ;;
+            5) list_rules_cli ;;
+            6) export_rules ;;
+            7) import_rules ;;
+            8) panel_menu ;;
+            9) journalctl -u realm --no-pager -n 100 || true ;;
+            0) exit 0 ;;
+            *) err "无效选项。" ;;
+        esac
+    done
 }
 
 main_menu
