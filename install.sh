@@ -12,6 +12,7 @@ BACKUP_DIR="/etc/realm/backups"
 PANEL_DATA="/etc/realm/panel_data.json"
 TMP_DIR="/tmp/realm-install"
 LOG_FILE="/var/log/realm-manager.log"
+NGINX_REALM_CONF="/etc/nginx/conf.d/realm-panel.conf"
 
 PANEL_PORT_DEFAULT="4794"
 PANEL_USER_DEFAULT="admin"
@@ -144,6 +145,38 @@ install_base_deps() {
         apk) apk add --no-cache curl tar ca-certificates python3 >/dev/null 2>&1 ;;
         *) ;;
     esac
+}
+
+install_nginx_dep() {
+    if command -v nginx >/dev/null 2>&1; then
+        return 0
+    fi
+    local pm
+    pm=$(detect_pkg_manager)
+    info "未检测到 nginx，正在自动安装。"
+    case "$pm" in
+        apt)
+            apt-get update -y >/dev/null 2>&1 || true
+            DEBIAN_FRONTEND=noninteractive apt-get install -y nginx >/dev/null 2>&1
+            ;;
+        dnf) dnf install -y nginx >/dev/null 2>&1 ;;
+        yum) yum install -y nginx >/dev/null 2>&1 ;;
+        apk) apk add --no-cache nginx >/dev/null 2>&1 ;;
+        *) err "无法识别包管理器，请手动安装 nginx。"; return 1 ;;
+    esac
+    command -v nginx >/dev/null 2>&1 || { err "nginx 安装失败。"; return 1; }
+}
+
+ensure_nginx_conf_dir() {
+    mkdir -p /etc/nginx/conf.d
+    if [[ -f /etc/nginx/nginx.conf ]] && ! grep -Eq 'include\s+/etc/nginx/conf\.d/\*\.conf;' /etc/nginx/nginx.conf; then
+        warn "未在 /etc/nginx/nginx.conf 检测到 conf.d include，正在尝试自动添加。"
+        if grep -qE '^[[:space:]]*http[[:space:]]*\{' /etc/nginx/nginx.conf; then
+            sed -i '/^[[:space:]]*http[[:space:]]*{/a\\    include /etc/nginx/conf.d/*.conf;' /etc/nginx/nginx.conf
+        else
+            warn "未找到 http 块，请手动确认 nginx.conf 已包含 /etc/nginx/conf.d/*.conf。"
+        fi
+    fi
 }
 
 get_arch() {
@@ -735,6 +768,78 @@ update_panel_port() {
     info "面板端口已更新为 ${port}。"
 }
 
+
+configure_nginx_proxy() {
+    [[ -f "$PANEL_SERVICE_FILE" ]] || { err "面板尚未安装。"; return 1; }
+    install_nginx_dep || return 1
+    ensure_nginx_conf_dir
+
+    local panel_port panel_cert panel_key upstream_scheme listen_port server_name public_ip
+    panel_port=$(get_panel_env PANEL_PORT); panel_port="${panel_port:-$PANEL_PORT_DEFAULT}"
+    panel_cert=$(get_panel_env PANEL_CERT); panel_key=$(get_panel_env PANEL_KEY)
+    upstream_scheme="http"
+    [[ -n "$panel_cert" && -n "$panel_key" ]] && upstream_scheme="https"
+
+    read -rp "Nginx 监听端口 [默认 80]: " listen_port
+    listen_port="${listen_port:-80}"
+    validate_port "$listen_port" || { err "Nginx 监听端口无效。"; return 1; }
+    read -rp "server_name [默认 _，也可填域名/IP]: " server_name
+    server_name="${server_name:-_}"
+    server_name="${server_name//;/}"
+
+    cat > "$NGINX_REALM_CONF" <<EOF
+# Realm 面板反代配置 - 由 install.sh 自动生成
+# 实际面板端口: ${panel_port}
+# 上游协议: ${upstream_scheme}
+server {
+    listen ${listen_port};
+    server_name ${server_name};
+
+    client_max_body_size 10m;
+
+    location / {
+        proxy_pass ${upstream_scheme}://127.0.0.1:${panel_port};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+EOF
+
+    if [[ "$upstream_scheme" == "https" ]]; then
+        cat >> "$NGINX_REALM_CONF" <<'EOF'
+        proxy_ssl_server_name off;
+        proxy_ssl_verify off;
+EOF
+    fi
+
+    cat >> "$NGINX_REALM_CONF" <<'EOF'
+    }
+}
+EOF
+
+    if ! nginx -t; then
+        err "nginx 配置检测失败，已写入: ${NGINX_REALM_CONF}"
+        return 1
+    fi
+
+    systemctl enable nginx >/dev/null 2>&1 || true
+    if systemctl is-active --quiet nginx 2>/dev/null; then
+        systemctl reload nginx
+    else
+        systemctl restart nginx
+    fi
+    public_ip=$(get_local_ip)
+    info "Nginx 反代配置已更新。"
+    echo "配置文件: ${NGINX_REALM_CONF}"
+    echo "上游面板: ${upstream_scheme}://127.0.0.1:${panel_port}"
+    echo "访问地址: http://${public_ip}:${listen_port}"
+}
+
 uninstall_panel() {
     systemctl stop "$PANEL_SERVICE" >/dev/null 2>&1 || true
     systemctl disable "$PANEL_SERVICE" >/dev/null 2>&1 || true
@@ -828,8 +933,9 @@ panel_menu() {
         echo "4. 修改登录信息"
         echo "5. 配置监听 IP / HTTPS IP 证书"
         echo "6. 查看面板状态"
+        echo "7. 配置 Nginx 反代面板"
         echo "0. 返回"
-        read -rp "请选择 [0-6]: " opt
+        read -rp "请选择 [0-7]: " opt
         case "$opt" in
             1) install_panel ;;
             2) uninstall_panel ;;
@@ -837,6 +943,7 @@ panel_menu() {
             4) update_panel_login ;;
             5) configure_panel_tls ;;
             6) systemctl status "$PANEL_SERVICE" --no-pager || true ;;
+            7) configure_nginx_proxy ;;
             0) return ;;
             *) err "无效选项。" ;;
         esac
