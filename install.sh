@@ -875,34 +875,17 @@ path, tmp, block = sys.argv[1], sys.argv[2], sys.argv[3]
 try:
     text = open(path, encoding='utf-8', errors='ignore').read()
 except FileNotFoundError:
-    text = 'events { worker_connections 1024; }
-http {
-}
-'
-pattern = r'
-?\s*# BEGIN REALM_PANEL_PROXY
-.*?
-\s*# END REALM_PANEL_PROXY
-?'
-text = re.sub(pattern, '
-', text, flags=re.S)
-if re.search(r'http\s*\{', text):
+    text = "events { worker_connections 1024; }\nhttp {\n}\n"
+pattern = r"\n?\s*# BEGIN REALM_PANEL_PROXY\n.*?\n\s*# END REALM_PANEL_PROXY\n?"
+text = re.sub(pattern, "\n", text, flags=re.S)
+if re.search(r"http\s*\{", text):
     idx = text.rfind('}')
     if idx == -1:
         raise SystemExit('nginx.conf missing http closing brace')
-    text = text[:idx].rstrip() + '
-
-' + block + '
-' + text[idx:]
+    text = text[:idx].rstrip() + "\n\n" + block + "\n" + text[idx:]
 else:
-    text = text.rstrip() + '
-
-http {
-' + block + '
-}
-'
-open(tmp, 'w', encoding='utf-8', newline='
-').write(text)
+    text = text.rstrip() + "\n\nhttp {\n" + block + "\n}\n"
+open(tmp, 'w', encoding='utf-8', newline='\n').write(text)
 PY
 
     cp "$NGINX_CONF" "${NGINX_CONF}.bak.$(date '+%Y%m%d%H%M%S')" 2>/dev/null || true
