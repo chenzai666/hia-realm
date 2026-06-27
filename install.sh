@@ -855,6 +855,7 @@ EOF
 
     if [[ "$upstream_scheme" == "https" ]]; then
         block+=$(cat <<'EOF'
+
             proxy_ssl_server_name off;
             proxy_ssl_verify off;
 EOF
@@ -879,10 +880,10 @@ except FileNotFoundError:
 pattern = r"\n?\s*# BEGIN REALM_PANEL_PROXY\n.*?\n\s*# END REALM_PANEL_PROXY\n?"
 text = re.sub(pattern, "\n", text, flags=re.S)
 
-def find_http_end(conf):
-    m = re.search(r"(^|\n)\s*http\s*\{", conf)
+def find_http_bounds(conf):
+    m = re.search(r"(^|\n)(?P<indent>\s*)http\s*\{", conf)
     if not m:
-        return None
+        return None, None
     open_idx = conf.find('{', m.start())
     depth = 0
     in_quote = None
@@ -911,14 +912,19 @@ def find_http_end(conf):
         elif ch == '}':
             depth -= 1
             if depth == 0:
-                return i
-    return None
+                return open_idx, i
+    return open_idx, None
 
-idx = find_http_end(text)
-if idx is None:
+open_idx, end_idx = find_http_bounds(text)
+if open_idx is None:
     text = text.rstrip() + "\n\nhttp {\n" + block + "\n}\n"
+elif end_idx is None:
+    raise SystemExit('nginx.conf missing http closing brace')
 else:
-    text = text[:idx].rstrip() + "\n\n" + block + "\n" + text[idx:]
+    insert_at = text.find('\n', open_idx)
+    if insert_at == -1 or insert_at > end_idx:
+        insert_at = open_idx + 1
+    text = text[:insert_at + 1] + block + "\n" + text[insert_at + 1:]
 open(tmp, 'w', encoding='utf-8', newline='\n').write(text)
 PY
 
