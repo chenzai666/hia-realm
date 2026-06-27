@@ -267,7 +267,9 @@ uninstall_realm() {
 }
 
 write_panel() {
-    cat > "$PANEL_BIN" <<'PY'
+    local panel_tmp
+    panel_tmp="/tmp/realm-panel.$$"
+    cat > "$panel_tmp" <<'PY'
 #!/usr/bin/env python3
 import base64
 import hashlib
@@ -573,7 +575,9 @@ if __name__ == "__main__":
     print("realm-panel listening on %s://%s:%d" % (scheme, PANEL_HOST, PANEL_PORT), flush=True)
     httpd.serve_forever()
 PY
-    chmod +x "$PANEL_BIN"
+    chmod +x "$panel_tmp"
+    install -m 755 "$panel_tmp" "$PANEL_BIN"
+    rm -f "$panel_tmp"
 }
 
 get_panel_env() {
@@ -637,6 +641,7 @@ install_panel() {
         read -rsp "面板密码 [默认 ${PANEL_PASS_DEFAULT}]: " pass; echo ""; pass="${pass:-$PANEL_PASS_DEFAULT}"
         host="0.0.0.0"; cert=""; key=""
     fi
+    systemctl stop "$PANEL_SERVICE" >/dev/null 2>&1 || true
     write_panel
     cat > "$PANEL_SERVICE_FILE" <<EOF
 [Unit]
