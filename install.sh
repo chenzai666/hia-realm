@@ -878,21 +878,58 @@ except FileNotFoundError:
     text = "events { worker_connections 1024; }\nhttp {\n}\n"
 pattern = r"\n?\s*# BEGIN REALM_PANEL_PROXY\n.*?\n\s*# END REALM_PANEL_PROXY\n?"
 text = re.sub(pattern, "\n", text, flags=re.S)
-if re.search(r"http\s*\{", text):
-    idx = text.rfind('}')
-    if idx == -1:
-        raise SystemExit('nginx.conf missing http closing brace')
-    text = text[:idx].rstrip() + "\n\n" + block + "\n" + text[idx:]
-else:
+
+def find_http_end(conf):
+    m = re.search(r"(^|\n)\s*http\s*\{", conf)
+    if not m:
+        return None
+    open_idx = conf.find('{', m.start())
+    depth = 0
+    in_quote = None
+    escape = False
+    in_comment = False
+    for i in range(open_idx, len(conf)):
+        ch = conf[i]
+        if in_comment:
+            if ch == '\n':
+                in_comment = False
+            continue
+        if in_quote:
+            if escape:
+                escape = False
+            elif ch == '\\':
+                escape = True
+            elif ch == in_quote:
+                in_quote = None
+            continue
+        if ch == '#':
+            in_comment = True
+        elif ch in ('"', "'"):
+            in_quote = ch
+        elif ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return i
+    return None
+
+idx = find_http_end(text)
+if idx is None:
     text = text.rstrip() + "\n\nhttp {\n" + block + "\n}\n"
+else:
+    text = text[:idx].rstrip() + "\n\n" + block + "\n" + text[idx:]
 open(tmp, 'w', encoding='utf-8', newline='\n').write(text)
 PY
 
-    cp "$NGINX_CONF" "${NGINX_CONF}.bak.$(date '+%Y%m%d%H%M%S')" 2>/dev/null || true
+    local nginx_bak
+    nginx_bak="${NGINX_CONF}.bak.$(date '+%Y%m%d%H%M%S')"
+    cp "$NGINX_CONF" "$nginx_bak" 2>/dev/null || true
     mv "$tmp" "$NGINX_CONF"
 
     if ! nginx -t; then
-        err "nginx 配置检测失败，已写入: ${NGINX_CONF}"
+        [[ -f "$nginx_bak" ]] && cp "$nginx_bak" "$NGINX_CONF"
+        err "nginx config test failed; restored previous config: ${NGINX_CONF}"
         return 1
     fi
 
