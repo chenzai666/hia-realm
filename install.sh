@@ -79,6 +79,7 @@ validate_public_ipv4() {
     (( a == 172 && b >= 16 && b <= 31 )) && return 1
     (( a == 192 && b == 168 )) && return 1
     (( a == 198 && (b == 18 || b == 19) )) && return 1
+    return 0
 }
 
 sanitize_name() {

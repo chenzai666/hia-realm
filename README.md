@@ -18,7 +18,8 @@
 - [规则导出 / 导入](#规则导出--导入)
 - [定时自动备份（cron）](#定时自动备份cron)
 - [FTP / SFTP 异地备份](#ftp--sftp-异地备份)
-- [Web 面板（Rust）](#web-面板rust)
+- [Web 面板](#web-面板)
+- [面板 HTTPS 与 Nginx 反代](#面板-https-与-nginx-反代)
 - [常用路径](#常用路径)
 - [常见问题](#常见问题)
 - [安全建议](#安全建议)
@@ -38,7 +39,7 @@
 - 规则导入 / 导出
 - 定时自动备份（cron）
 - FTP / SFTP 远程自动备份
-- 可选：**Rust Web 面板**（浏览器可视化管理规则）
+- 可选：**Web 面板**（浏览器可视化管理规则）
 
 适用场景：
 
@@ -58,8 +59,7 @@
   - 端口检测：优先 `ss`，否则 `netstat`
   - cron：`cron/crond/crontab`（用于定时备份）
 - Web 面板额外依赖（脚本会自动处理）：
-  - Rust/cargo（通过 rustup 安装）
-  - `build-essential/pkg-config/libssl-dev` 或 `Development Tools/openssl-devel`
+  - `python3`
 
 ---
 
@@ -101,7 +101,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/chenzai666/hia-realm/main/in
 13. 一键导入所有规则
 14. 添加/删除定时备份任务
 15. 自动备份到FTP/SFTP
-16. Realm 面板管理
+8.  Realm 面板管理
 0.  退出
 ```
 
@@ -350,18 +350,15 @@ example.com:443
 
 ---
 
-## Web 面板（Rust）
+## Web 面板
 
 脚本菜单：
 
 ```
-16. Realm 面板管理
+8. Realm 面板管理
 ```
 
-你可以选择安装：
-
-- **快速安装部署**
-- **自编译部署**（Rust 编译）
+进入后可管理面板安装、卸载、端口、登录信息、TLS 与 Nginx 反代。
 
 ### 面板默认信息
 
@@ -398,6 +395,54 @@ http://<你的服务器IP>:4794
 
 > 注意：面板会将**启用的规则**写入 realm 配置，禁用规则不会写入 endpoints。  
 > 若启用规则为空，为避免 Realm 无 endpoints，面板会写入一个 keepalive 的本地占位规则（127.0.0.1:65534）。
+
+---
+
+## 面板 HTTPS 与 Nginx 反代
+
+进入主菜单的 `8. Realm 面板管理` 后，可使用以下功能。
+
+### 5. 配置监听 IP / HTTPS IP 证书
+
+该功能可修改面板监听地址，并在证书文件不存在时通过 acme.sh 申请公网 IPv4 证书。默认文件路径为：
+
+```text
+证书：/root/ygkkkca/cert.crt
+私钥：/root/ygkkkca/private.key
+```
+
+申请 IP 证书的前提：
+
+- 填写的地址必须是可路由的公网 IPv4。
+- 公网 TCP `80` 必须能到达运行面板的实例；申请过程使用 acme.sh standalone 验证。
+- TCP `80` 不得被其他服务占用。
+- 证书为短周期证书，需保持 acme.sh 的自动续期任务可运行。
+
+NAT LXC 场景：只有 `公网IP:80 -> LXC:80` 映射时才能申请 IP 证书。若仅映射高端口，不能将 ACME 验证改为高端口；请使用域名证书的 DNS-01 验证，再配置 Nginx 反代。
+
+### 7. 配置 Nginx 反代面板
+
+该功能会将 Nginx 反代到本机面板，并先执行 `nginx -t`；配置测试失败时会恢复原配置。它不会自动申请域名证书，使用 HTTPS 前请先准备好证书文件：
+
+```text
+证书：/etc/nginx/ssl/cert.crt
+私钥：/etc/nginx/ssl/private.key
+```
+
+配置时填写反代域名与 Nginx 监听端口，默认监听 `443`。NAT LXC 可将公网高端口映射到 LXC 的 `443`，然后使用：
+
+```text
+https://panel.example.com:外部映射端口
+```
+
+配置完成后检查：
+
+```bash
+nginx -t
+systemctl status nginx realm-panel
+```
+
+安全建议：面板应仅监听本机或可信网段；通过 Nginx 暴露时，配合防火墙白名单、强密码和 TLS 访问。
 
 ---
 
