@@ -68,7 +68,7 @@
 ### 1️⃣ 一键运行（推荐）
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/hiapb/hia-realm/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/chenzai666/hia-realm/main/install.sh)
 ```
 
 > ⚠️ 必须使用 root 用户运行  
@@ -338,7 +338,7 @@ example.com:443
 
 功能：
 
-- 调用 hiapb FTP 备份脚本进行上传
+- 调用本项目的 FTP/SFTP 备份流程进行上传
 - 支持 FTP / SFTP
 - 可多服务器异地备份
 
@@ -470,7 +470,7 @@ http://<你的服务器IP>:4794
 
 ## 项目地址
 
-GitHub：`https://github.com/hiapb/hia-realm`
+GitHub：`https://github.com/chenzai666/hia-realm`
 
 ---
 
@@ -481,9 +481,8 @@ GitHub：`https://github.com/hiapb/hia-realm`
 如需商用，请先联系作者获得明确授权，否则视为侵权。
 
 **2) 转载 / 转发须标注来源**  
-允许非商业性质的转载、分享与转发，但必须 **保留原作者信息**，并在显著位置标注项目来源：  
-GitHub：`https://github.com/hiapb/hia-realm`
-博客: `https://nuro.cc/index.php/archives/15/`
+允许非商业性质的转载、分享与转发，但必须在显著位置标注本项目来源：
+GitHub：`https://github.com/chenzai666/hia-realm`
 
 **3) 合法合规使用**  
 本项目仅用于合法合规的网络学习与测试用途。  
