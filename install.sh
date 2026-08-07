@@ -20,8 +20,10 @@ NGINX_KEY_DEFAULT="/etc/nginx/ssl/private.key"
 PANEL_PORT_DEFAULT="4794"
 PANEL_USER_DEFAULT="admin"
 PANEL_PASS_DEFAULT="123456"
-PANEL_CERT_DEFAULT="/etc/realm/panel-ssl/cert.crt"
-PANEL_KEY_DEFAULT="/etc/realm/panel-ssl/private.key"
+PANEL_CERT_DEFAULT="/etc/panel-ssl/cert.crt"
+PANEL_KEY_DEFAULT="/etc/panel-ssl/private.key"
+PANEL_CERT_LEGACY_DEFAULT="/etc/realm/panel-ssl/cert.crt"
+PANEL_KEY_LEGACY_DEFAULT="/etc/realm/panel-ssl/private.key"
 
 GREEN="\033[32m"
 RED="\033[31m"
@@ -657,6 +659,76 @@ get_panel_env() {
     sed -n -E "s|^Environment=\"${key}=([^\"]*)\"$|\\1|p" "$PANEL_SERVICE_FILE" | tail -1
 }
 
+migrate_legacy_panel_certificate() {
+    local cert_path="$1" key_path="$2" cert_dir key_dir
+
+    [[ "$cert_path" == "$PANEL_CERT_LEGACY_DEFAULT" && "$key_path" == "$PANEL_KEY_LEGACY_DEFAULT" ]] || return 1
+    [[ -f "$cert_path" && -f "$key_path" ]] || return 1
+
+    cert_dir=$(dirname "$PANEL_CERT_DEFAULT")
+    key_dir=$(dirname "$PANEL_KEY_DEFAULT")
+    mkdir -p "$cert_dir" "$key_dir" || return 1
+
+    if [[ -f "$PANEL_CERT_DEFAULT" || -f "$PANEL_KEY_DEFAULT" ]]; then
+        [[ -f "$PANEL_CERT_DEFAULT" && -f "$PANEL_KEY_DEFAULT" ]] || return 1
+    else
+        install -m 644 "$cert_path" "$PANEL_CERT_DEFAULT" || return 1
+        install -m 600 "$key_path" "$PANEL_KEY_DEFAULT" || return 1
+    fi
+
+    chmod 600 "$PANEL_KEY_DEFAULT" 2>/dev/null || true
+    printf '%s|%s\n' "$PANEL_CERT_DEFAULT" "$PANEL_KEY_DEFAULT"
+}
+
+get_cert_ip_from_file() {
+    local cert_path="$1" cert_ip
+
+    [[ -f "$cert_path" ]] || return 1
+    command -v openssl >/dev/null 2>&1 || return 1
+    cert_ip=$(openssl x509 -in "$cert_path" -noout -ext subjectAltName 2>/dev/null \
+        | sed -nE 's/.*IP Address:([0-9.]+).*/\1/p' | head -1)
+    validate_public_ipv4 "$cert_ip" || return 1
+    printf '%s\n' "$cert_ip"
+}
+
+set_acme_domain_conf_value() {
+    local conf_file="$1" key="$2" value="$3"
+
+    [[ -f "$conf_file" ]] || return 1
+    if grep -q "^${key}=" "$conf_file"; then
+        sed -i -E "s|^${key}=.*|${key}='${value}'|" "$conf_file"
+    else
+        printf "%s='%s'\n" "$key" "$value" >> "$conf_file"
+    fi
+    chmod 600 "$conf_file" 2>/dev/null || true
+}
+
+sync_acme_certificate_install_path() {
+    local cert_path="$1" key_path="$2" cert_ip acme acme_real acme_home conf_file seen="|" updated=0
+
+    cert_ip=$(get_cert_ip_from_file "$cert_path" 2>/dev/null || true)
+    validate_public_ipv4 "$cert_ip" || return 1
+    acme=$(find_acme_sh 2>/dev/null || true)
+    [[ -n "$acme" ]] || return 1
+    acme_real=$(readlink -f "$acme" 2>/dev/null || printf '%s' "$acme")
+
+    for acme_home in "$(dirname "$acme_real")" "${HOME}/.acme.sh" "/root/.acme.sh"; do
+        for conf_file in \
+            "${acme_home}/${cert_ip}/${cert_ip}.conf" \
+            "${acme_home}/${cert_ip}_ecc/${cert_ip}.conf"; do
+            [[ -f "$conf_file" ]] || continue
+            [[ "$seen" == *"|${conf_file}|"* ]] && continue
+            seen+="${conf_file}|"
+            set_acme_domain_conf_value "$conf_file" Le_RealKeyPath "$key_path" || return 1
+            set_acme_domain_conf_value "$conf_file" Le_RealFullChainPath "$cert_path" || return 1
+            set_acme_domain_conf_value "$conf_file" Le_ReloadCmd "systemctl restart ${PANEL_SERVICE}" || return 1
+            updated=$((updated + 1))
+        done
+    done
+
+    (( updated > 0 ))
+}
+
 is_nginx_proxy_configured() {
     [[ -f "$NGINX_CONF" ]] && grep -qF '# BEGIN REALM_PANEL_PROXY' "$NGINX_CONF"
 }
@@ -737,14 +809,27 @@ install_panel() {
     check_root
     install_base_deps
     need_cmd python3
-    local port user pass host cert key existing ip scheme
+    local port user pass host cert key existing ip scheme cert_pair certificate_migrated
     existing=0
+    certificate_migrated=0
     [[ -f "$PANEL_SERVICE_FILE" ]] && existing=1
     if (( existing )); then
         port=$(get_panel_env PANEL_PORT); user=$(get_panel_env PANEL_USER); pass=$(get_panel_env PANEL_PASS)
         host=$(get_panel_env PANEL_HOST); cert=$(get_panel_env PANEL_CERT); key=$(get_panel_env PANEL_KEY)
         port="${port:-$PANEL_PORT_DEFAULT}"; user="${user:-$PANEL_USER_DEFAULT}"; pass="${pass:-$PANEL_PASS_DEFAULT}"
         host="${host:-0.0.0.0}"; cert="${cert:-}"; key="${key:-}"
+        if cert_pair=$(migrate_legacy_panel_certificate "$cert" "$key" 2>/dev/null); then
+            IFS='|' read -r cert key <<< "$cert_pair"
+            certificate_migrated=1
+            info "已将 Realm IP 证书迁移到 ${PANEL_CERT_DEFAULT}。"
+        elif [[ "$cert" == "$PANEL_CERT_LEGACY_DEFAULT" || "$key" == "$PANEL_KEY_LEGACY_DEFAULT" ]]; then
+            warn "未能迁移旧 IP 证书，当前仍使用旧路径。"
+        fi
+        if [[ -z "$cert" && -z "$key" ]] && cert_pair=$(migrate_legacy_panel_certificate "$PANEL_CERT_LEGACY_DEFAULT" "$PANEL_KEY_LEGACY_DEFAULT" 2>/dev/null); then
+            IFS='|' read -r cert key <<< "$cert_pair"
+            certificate_migrated=1
+            info "已将 Realm IP 证书迁移到 ${PANEL_CERT_DEFAULT}。"
+        fi
         info "检测到已安装面板，本次仅更新面板程序并保留配置。"
     else
         read -rp "面板端口 [默认 ${PANEL_PORT_DEFAULT}]: " port; port="${port:-$PANEL_PORT_DEFAULT}"
@@ -782,6 +867,9 @@ EOF
     systemctl daemon-reload
     systemctl enable "$PANEL_SERVICE" >/dev/null 2>&1 || true
     systemctl restart "$PANEL_SERVICE"
+    if (( certificate_migrated )) && [[ -n "$cert" && -n "$key" ]] && ! sync_acme_certificate_install_path "$cert" "$key"; then
+        warn "证书已迁移，但未找到可同步的 acme.sh 配置；请确认续期路径。"
+    fi
     if [[ "$host" == "127.0.0.1" ]]; then
         ip="127.0.0.1"
     else

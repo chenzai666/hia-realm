@@ -407,9 +407,11 @@ http://<你的服务器IP>:4794
 该功能可修改面板监听地址，并在证书文件不存在时通过 acme.sh 申请公网 IPv4 证书。默认文件路径为：
 
 ```text
-证书：/etc/realm/panel-ssl/cert.crt
-私钥：/etc/realm/panel-ssl/private.key
+证书：/etc/panel-ssl/cert.crt
+私钥：/etc/panel-ssl/private.key
 ```
+
+旧路径 `/etc/realm/panel-ssl/cert.crt` 与 `private.key` 会在更新面板时自动迁移到上述路径，并同步 acme.sh 的续期安装路径。
 
 申请 IP 证书的前提：
 
