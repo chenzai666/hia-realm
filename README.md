@@ -402,13 +402,13 @@ http://<你的服务器IP>:4794
 
 进入主菜单的 `8. Realm 面板管理` 后，可使用以下功能。
 
-### 5. 配置监听 IP / HTTPS IP 证书
+### 5. 配置面板直连 IP / HTTPS IP 证书
 
 该功能可修改面板监听地址，并在证书文件不存在时通过 acme.sh 申请公网 IPv4 证书。默认文件路径为：
 
 ```text
-证书：/root/ygkkkca/cert.crt
-私钥：/root/ygkkkca/private.key
+证书：/etc/realm/panel-ssl/cert.crt
+私钥：/etc/realm/panel-ssl/private.key
 ```
 
 申请 IP 证书的前提：
@@ -428,6 +428,10 @@ NAT LXC 场景：只有 `公网IP:80 -> LXC:80` 映射时才能申请 IP 证书�
 证书：/etc/nginx/ssl/cert.crt
 私钥：/etc/nginx/ssl/private.key
 ```
+
+启用反代后，Realm 面板固定监听 `127.0.0.1` 并使用 HTTP 回源，同时清空面板自身的 IP 证书配置。后续更新面板时会自动识别反代配置，不会查找或复用其他项目位于 `/root/ygkkkca/` 的 IP 证书。
+
+反代配置存在时，脚本会阻止再次配置面板直连 IP 证书，避免 Nginx 的 HTTP 回源与面板 HTTPS 状态不一致。
 
 配置时填写反代域名与 Nginx 监听端口，默认监听 `443`。NAT LXC 可将公网高端口映射到 LXC 的 `443`，然后使用：
 

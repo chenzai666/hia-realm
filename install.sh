@@ -20,8 +20,8 @@ NGINX_KEY_DEFAULT="/etc/nginx/ssl/private.key"
 PANEL_PORT_DEFAULT="4794"
 PANEL_USER_DEFAULT="admin"
 PANEL_PASS_DEFAULT="123456"
-PANEL_CERT_DEFAULT="/root/ygkkkca/cert.crt"
-PANEL_KEY_DEFAULT="/root/ygkkkca/private.key"
+PANEL_CERT_DEFAULT="/etc/realm/panel-ssl/cert.crt"
+PANEL_KEY_DEFAULT="/etc/realm/panel-ssl/private.key"
 
 GREEN="\033[32m"
 RED="\033[31m"
@@ -641,6 +641,10 @@ get_panel_env() {
     sed -n -E "s|^Environment=\"${key}=([^\"]*)\"$|\\1|p" "$PANEL_SERVICE_FILE" | tail -1
 }
 
+is_nginx_proxy_configured() {
+    [[ -f "$NGINX_CONF" ]] && grep -qF '# BEGIN REALM_PANEL_PROXY' "$NGINX_CONF"
+}
+
 find_acme_sh() {
     command -v acme.sh 2>/dev/null && return 0
     [[ -x "$HOME/.acme.sh/acme.sh" ]] && { echo "$HOME/.acme.sh/acme.sh"; return 0; }
@@ -685,9 +689,6 @@ install_panel() {
         host=$(get_panel_env PANEL_HOST); cert=$(get_panel_env PANEL_CERT); key=$(get_panel_env PANEL_KEY)
         port="${port:-$PANEL_PORT_DEFAULT}"; user="${user:-$PANEL_USER_DEFAULT}"; pass="${pass:-$PANEL_PASS_DEFAULT}"
         host="${host:-0.0.0.0}"; cert="${cert:-}"; key="${key:-}"
-        if [[ -z "$cert" && -z "$key" && -f "$PANEL_CERT_DEFAULT" && -f "$PANEL_KEY_DEFAULT" ]]; then
-            cert="$PANEL_CERT_DEFAULT"; key="$PANEL_KEY_DEFAULT"; info "检测到默认路径证书，已自动恢复 HTTPS。"
-        fi
         info "检测到已安装面板，本次仅更新面板程序并保留配置。"
     else
         read -rp "面板端口 [默认 ${PANEL_PORT_DEFAULT}]: " port; port="${port:-$PANEL_PORT_DEFAULT}"
@@ -695,6 +696,10 @@ install_panel() {
         read -rp "面板用户名 [默认 ${PANEL_USER_DEFAULT}]: " user; user="${user:-$PANEL_USER_DEFAULT}"
         read -rsp "面板密码 [默认 ${PANEL_PASS_DEFAULT}]: " pass; echo ""; pass="${pass:-$PANEL_PASS_DEFAULT}"
         host="0.0.0.0"; cert=""; key=""
+    fi
+    if is_nginx_proxy_configured; then
+        host="127.0.0.1"; cert=""; key=""
+        info "检测到 Nginx 反代，面板将保持本机 HTTP 回源，不读取 IP 证书。"
     fi
     systemctl stop "$PANEL_SERVICE" >/dev/null 2>&1 || true
     write_panel
@@ -721,7 +726,11 @@ EOF
     systemctl daemon-reload
     systemctl enable "$PANEL_SERVICE" >/dev/null 2>&1 || true
     systemctl restart "$PANEL_SERVICE"
-    ip=$(get_local_ip)
+    if [[ "$host" == "127.0.0.1" ]]; then
+        ip="127.0.0.1"
+    else
+        ip=$(get_local_ip)
+    fi
     scheme=http; [[ -n "$cert" && -n "$key" ]] && scheme=https
     info "Realm 面板已安装/更新。"
     echo "访问地址: ${scheme}://${ip}:${port}"
@@ -731,6 +740,10 @@ EOF
 
 configure_panel_tls() {
     [[ -f "$PANEL_SERVICE_FILE" ]] || { err "面板尚未安装。"; return 1; }
+    if is_nginx_proxy_configured; then
+        err "已配置 Nginx 反代，面板必须保持 127.0.0.1 HTTP 回源，不能再配置 IP 证书。"
+        return 1
+    fi
     local host cert key cert_ip port
     read -rp "监听 IP [默认 0.0.0.0]: " host; host="${host:-0.0.0.0}"
     read -rp "证书文件路径 [默认 ${PANEL_CERT_DEFAULT}]: " cert; cert="${cert:-$PANEL_CERT_DEFAULT}"
@@ -786,11 +799,9 @@ configure_nginx_proxy() {
     install_nginx_dep || return 1
     ensure_nginx_main_conf
 
-    local panel_port panel_cert panel_key upstream_scheme domain listen_port cert key scheme block tmp
+    local panel_port upstream_scheme domain listen_port cert key scheme block tmp
     panel_port=$(get_panel_env PANEL_PORT); panel_port="${panel_port:-$PANEL_PORT_DEFAULT}"
-    panel_cert=$(get_panel_env PANEL_CERT); panel_key=$(get_panel_env PANEL_KEY)
     upstream_scheme="http"
-    [[ -n "$panel_cert" && -n "$panel_key" ]] && upstream_scheme="https"
 
     read -rp "反代域名（例如 panel.example.com）: " domain
     [[ -n "$domain" ]] || { err "域名不能为空。"; return 1; }
@@ -852,16 +863,8 @@ EOF
 EOF
 )
 
-    if [[ "$upstream_scheme" == "https" ]]; then
-        block+=$(cat <<'EOF'
-
-            proxy_ssl_server_name off;
-            proxy_ssl_verify off;
-EOF
-)
-    fi
-
     block+=$(cat <<'EOF'
+
         }
     }
     # END REALM_PANEL_PROXY
@@ -927,8 +930,9 @@ else:
 open(tmp, 'w', encoding='utf-8', newline='\n').write(text)
 PY
 
-    local nginx_bak
+    local nginx_bak panel_service_bak
     nginx_bak="${NGINX_CONF}.bak.$(date '+%Y%m%d%H%M%S')"
+    panel_service_bak="${PANEL_SERVICE_FILE}.bak.$(date '+%Y%m%d%H%M%S')"
     cp "$NGINX_CONF" "$nginx_bak" 2>/dev/null || true
     mv "$tmp" "$NGINX_CONF"
 
@@ -938,17 +942,50 @@ PY
         return 1
     fi
 
+    cp "$PANEL_SERVICE_FILE" "$panel_service_bak"
+    sed -i -E 's|Environment="PANEL_HOST=.*"|Environment="PANEL_HOST=127.0.0.1"|' "$PANEL_SERVICE_FILE"
+    sed -i -E 's|Environment="PANEL_CERT=.*"|Environment="PANEL_CERT="|' "$PANEL_SERVICE_FILE"
+    sed -i -E 's|Environment="PANEL_KEY=.*"|Environment="PANEL_KEY="|' "$PANEL_SERVICE_FILE"
+    if ! systemctl daemon-reload || ! systemctl restart "$PANEL_SERVICE"; then
+        cp "$panel_service_bak" "$PANEL_SERVICE_FILE"
+        cp "$nginx_bak" "$NGINX_CONF"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl restart "$PANEL_SERVICE" >/dev/null 2>&1 || true
+        rm -f "$panel_service_bak"
+        err "面板切换为本机 HTTP 回源失败，已恢复原配置。"
+        return 1
+    fi
+
     systemctl enable nginx >/dev/null 2>&1 || true
     if systemctl is-active --quiet nginx 2>/dev/null; then
-        systemctl reload nginx
+        if ! systemctl reload nginx; then
+            cp "$panel_service_bak" "$PANEL_SERVICE_FILE"
+            cp "$nginx_bak" "$NGINX_CONF"
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            systemctl restart "$PANEL_SERVICE" >/dev/null 2>&1 || true
+            nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+            rm -f "$panel_service_bak"
+            err "Nginx 重载失败，已恢复面板和 Nginx 原配置。"
+            return 1
+        fi
     else
-        systemctl restart nginx
+        if ! systemctl restart nginx; then
+            cp "$panel_service_bak" "$PANEL_SERVICE_FILE"
+            cp "$nginx_bak" "$NGINX_CONF"
+            systemctl daemon-reload >/dev/null 2>&1 || true
+            systemctl restart "$PANEL_SERVICE" >/dev/null 2>&1 || true
+            rm -f "$panel_service_bak"
+            err "Nginx 启动失败，已恢复面板和 Nginx 原配置。"
+            return 1
+        fi
     fi
+    rm -f "$panel_service_bak"
     info "Nginx 反代配置已更新。"
     echo "配置文件: ${NGINX_CONF}"
     echo "Nginx 证书: ${cert}"
     echo "Nginx 私钥: ${key}"
     echo "上游面板: ${upstream_scheme}://127.0.0.1:${panel_port}"
+    echo "面板监听: 127.0.0.1（已停用面板 IP 证书）"
     echo "访问地址: ${scheme}://${domain}$([[ "$listen_port" != "80" && "$listen_port" != "443" ]] && echo ":${listen_port}")"
 }
 
@@ -1043,7 +1080,7 @@ panel_menu() {
         echo "2. 卸载面板"
         echo "3. 修改面板端口"
         echo "4. 修改登录信息"
-        echo "5. 配置监听 IP / HTTPS IP 证书"
+        echo "5. 配置面板直连 IP / HTTPS IP 证书"
         echo "6. 查看面板状态"
         echo "7. 配置 Nginx 反代面板"
         echo "0. 返回"
