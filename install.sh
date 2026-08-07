@@ -57,6 +57,22 @@ validate_port() {
     (( port >= 1 && port <= 65535 ))
 }
 
+validate_domain_name() {
+    local domain="$1" label
+    [[ ${#domain} -le 253 ]] || return 1
+    [[ "$domain" =~ ^[A-Za-z0-9.-]+$ ]] || return 1
+    [[ "$domain" == *.* && "$domain" != .* && "$domain" != *. && "$domain" != *..* ]] || return 1
+    local IFS='.' labels
+    read -ra labels <<< "$domain"
+    for label in "${labels[@]}"; do
+        [[ ${#label} -le 63 && "$label" != -* && "$label" != *- ]] || return 1
+    done
+}
+
+validate_certificate_path() {
+    [[ "$1" =~ ^/[A-Za-z0-9._/@%+=,:~-]+$ ]]
+}
+
 validate_ip() {
     local ip="$1"
     [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
@@ -645,6 +661,46 @@ is_nginx_proxy_configured() {
     [[ -f "$NGINX_CONF" ]] && grep -qF '# BEGIN REALM_PANEL_PROXY' "$NGINX_CONF"
 }
 
+certificate_matches_domain() {
+    local cert="$1" domain="$2" x509_help
+    command -v openssl >/dev/null 2>&1 || return 2
+    x509_help=$(openssl x509 -help 2>&1 || true)
+    grep -q -- '-checkhost' <<< "$x509_help" || return 2
+    openssl x509 -in "$cert" -noout -checkhost "$domain" >/dev/null 2>&1
+}
+
+find_domain_certificate() {
+    local domain="$1" cert key
+    while IFS='|' read -r cert key; do
+        [[ -f "$cert" && -f "$key" ]] || continue
+        if certificate_matches_domain "$cert" "$domain"; then
+            printf '%s|%s\n' "$cert" "$key"
+            return 0
+        fi
+    done <<EOF
+${NGINX_SSL_DIR}/${domain}/fullchain.pem|${NGINX_SSL_DIR}/${domain}/privkey.pem
+/etc/letsencrypt/live/${domain}/fullchain.pem|/etc/letsencrypt/live/${domain}/privkey.pem
+${NGINX_SSL_DIR}/${domain}.crt|${NGINX_SSL_DIR}/${domain}.key
+${NGINX_CERT_DEFAULT}|${NGINX_KEY_DEFAULT}
+EOF
+    return 1
+}
+
+validate_domain_certificate() {
+    local cert="$1" domain="$2" status
+    if certificate_matches_domain "$cert" "$domain"; then
+        return 0
+    else
+        status=$?
+    fi
+    if (( status == 2 )); then
+        warn "当前 OpenSSL 不支持域名校验，请确认该证书包含域名：${domain}"
+        return 0
+    fi
+    err "证书与反代域名不匹配：${domain}"
+    return 1
+}
+
 find_acme_sh() {
     command -v acme.sh 2>/dev/null && return 0
     [[ -x "$HOME/.acme.sh/acme.sh" ]] && { echo "$HOME/.acme.sh/acme.sh"; return 0; }
@@ -799,31 +855,50 @@ configure_nginx_proxy() {
     install_nginx_dep || return 1
     ensure_nginx_main_conf
 
-    local panel_port upstream_scheme domain listen_port cert key scheme block tmp
+    local panel_port upstream_scheme domain listen_port cert key scheme block tmp cert_pair cert_input key_input cert_source
     panel_port=$(get_panel_env PANEL_PORT); panel_port="${panel_port:-$PANEL_PORT_DEFAULT}"
     upstream_scheme="http"
 
     read -rp "反代域名（例如 panel.example.com）: " domain
     [[ -n "$domain" ]] || { err "域名不能为空。"; return 1; }
-    domain="${domain//;/}"
     domain="${domain// /}"
+    domain="${domain,,}"
+    validate_domain_name "$domain" || { err "反代域名格式无效。"; return 1; }
 
     read -rp "Nginx 监听端口 [默认 443]: " listen_port
     listen_port="${listen_port:-443}"
     validate_port "$listen_port" || { err "Nginx 监听端口无效。"; return 1; }
 
-    cert="$NGINX_CERT_DEFAULT"
-    key="$NGINX_KEY_DEFAULT"
     mkdir -p "$NGINX_SSL_DIR"
+    cert=""; key=""; cert_source=""
     scheme="http"
     if [[ "$listen_port" == "443" ]]; then
         scheme="https"
+        cert_source="自动匹配"
+        if cert_pair=$(find_domain_certificate "$domain"); then
+            IFS='|' read -r cert key <<< "$cert_pair"
+        else
+            cert="${NGINX_SSL_DIR}/${domain}/fullchain.pem"
+            key="${NGINX_SSL_DIR}/${domain}/privkey.pem"
+        fi
+        read -rp "域名证书路径 [默认 ${cert}]: " cert_input
+        read -rp "域名私钥路径 [默认 ${key}]: " key_input
+        if [[ -n "$cert_input" || -n "$key_input" ]]; then
+            cert_source="手动指定"
+        fi
+        cert="${cert_input:-$cert}"
+        key="${key_input:-$key}"
+        validate_certificate_path "$cert" && validate_certificate_path "$key" || {
+            err "证书和私钥必须使用不含空格或配置符号的绝对路径。"
+            return 1
+        }
         if [[ ! -f "$cert" || ! -f "$key" ]]; then
-            warn "未检测到 Nginx 证书，请将证书放到：$cert"
-            warn "请将私钥放到：$key"
-            err "缺少 Nginx HTTPS 证书，已创建目录：$NGINX_SSL_DIR"
+            warn "域名证书路径：$cert"
+            warn "域名私钥路径：$key"
+            err "缺少反代域名证书或私钥。"
             return 1
         fi
+        validate_domain_certificate "$cert" "$domain" || return 1
     fi
 
     block=$(cat <<EOF
@@ -984,6 +1059,7 @@ PY
     echo "配置文件: ${NGINX_CONF}"
     echo "Nginx 证书: ${cert}"
     echo "Nginx 私钥: ${key}"
+    [[ "$listen_port" == "443" ]] && echo "证书来源: ${cert_source}"
     echo "上游面板: ${upstream_scheme}://127.0.0.1:${panel_port}"
     echo "面板监听: 127.0.0.1（已停用面板 IP 证书）"
     echo "访问地址: ${scheme}://${domain}$([[ "$listen_port" != "80" && "$listen_port" != "443" ]] && echo ":${listen_port}")"

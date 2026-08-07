@@ -21,6 +21,27 @@ PANEL_SERVICE="realm-panel.service"
 mkdir -p "$NGINX_SSL_DIR"
 touch "$NGINX_CERT_DEFAULT" "$NGINX_KEY_DEFAULT"
 
+validate_domain_name 'panel.example.com'
+! validate_domain_name 'panel.example.com;include'
+validate_certificate_path "$NGINX_CERT_DEFAULT"
+
+if command -v openssl >/dev/null 2>&1 && openssl x509 -help 2>&1 | grep -q -- '-checkhost'; then
+    MATCH_CERT="$TEST_DIR/matching.crt"
+    MATCH_KEY="$TEST_DIR/matching.key"
+    CERT_SUBJECT='/CN=panel.example.com'
+    [[ -n "${MSYSTEM:-}" ]] && CERT_SUBJECT='//CN=panel.example.com'
+    openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+        -subj "$CERT_SUBJECT" \
+        -addext 'subjectAltName=DNS:panel.example.com' \
+        -keyout "$MATCH_KEY" -out "$MATCH_CERT" >/dev/null 2>&1
+    certificate_matches_domain "$MATCH_CERT" 'panel.example.com'
+    ! certificate_matches_domain "$MATCH_CERT" 'other.example.com'
+    cp "$MATCH_CERT" "$NGINX_CERT_DEFAULT"
+    cp "$MATCH_KEY" "$NGINX_KEY_DEFAULT"
+else
+    certificate_matches_domain() { return 0; }
+fi
+
 write_nginx_config() {
     cat > "$NGINX_CONF" <<'EOF'
 events { worker_connections 16; }
@@ -55,9 +76,11 @@ get_local_ip() { printf '%s\n' '203.0.113.10'; }
 
 write_nginx_config
 write_panel_service
-configure_nginx_proxy <<< $'panel.example.com\n443\n'
+configure_nginx_proxy <<< $'panel.example.com\n443\n\n\n'
 
 grep -qF 'proxy_pass http://127.0.0.1:4794;' "$NGINX_CONF"
+grep -qF "ssl_certificate ${NGINX_CERT_DEFAULT};" "$NGINX_CONF"
+grep -qF "ssl_certificate_key ${NGINX_KEY_DEFAULT};" "$NGINX_CONF"
 ! grep -qF 'proxy_ssl_verify' "$NGINX_CONF"
 grep -qF 'Environment="PANEL_HOST=127.0.0.1"' "$PANEL_SERVICE_FILE"
 grep -qF 'Environment="PANEL_CERT="' "$PANEL_SERVICE_FILE"
@@ -79,10 +102,18 @@ grep -qF 'Environment="PANEL_KEY="' "$PANEL_SERVICE_FILE"
 [[ "$PANEL_CERT_DEFAULT" != '/root/ygkkkca/cert.crt' ]]
 [[ "$PANEL_KEY_DEFAULT" != '/root/ygkkkca/private.key' ]]
 
+CUSTOM_CERT="$TEST_DIR/custom-domain.crt"
+CUSTOM_KEY="$TEST_DIR/custom-domain.key"
+cp "$NGINX_CERT_DEFAULT" "$CUSTOM_CERT"
+cp "$NGINX_KEY_DEFAULT" "$CUSTOM_KEY"
+configure_nginx_proxy <<< $'panel.example.com\n443\n'"$CUSTOM_CERT"$'\n'"$CUSTOM_KEY"$'\n'
+grep -qF "ssl_certificate ${CUSTOM_CERT};" "$NGINX_CONF"
+grep -qF "ssl_certificate_key ${CUSTOM_KEY};" "$NGINX_CONF"
+
 write_nginx_config
 write_panel_service
 SYSTEMCTL_FAIL='restart realm-panel.service'
-if configure_nginx_proxy <<< $'panel.example.com\n443\n'; then
+if configure_nginx_proxy <<< $'panel.example.com\n443\n\n\n'; then
     echo '面板重启失败时反代配置不应成功。' >&2
     exit 1
 fi

@@ -422,12 +422,16 @@ NAT LXC 场景：只有 `公网IP:80 -> LXC:80` 映射时才能申请 IP 证书�
 
 ### 7. 配置 Nginx 反代面板
 
-该功能会将 Nginx 反代到本机面板，并先执行 `nginx -t`；配置测试失败时会恢复原配置。它不会自动申请域名证书，使用 HTTPS 前请先准备好证书文件：
+该功能会将 Nginx 反代到本机面板，并先执行 `nginx -t`；配置测试失败时会恢复原配置。它不会自动申请域名证书，使用 HTTPS 前请先准备好证书文件。
 
-```text
-证书：/etc/nginx/ssl/cert.crt
-私钥：/etc/nginx/ssl/private.key
-```
+默认监听 `443` 时，脚本会按以下顺序自动寻找与反代域名匹配的证书：
+
+1. `/etc/nginx/ssl/<域名>/fullchain.pem` 与 `privkey.pem`
+2. `/etc/letsencrypt/live/<域名>/fullchain.pem` 与 `privkey.pem`
+3. `/etc/nginx/ssl/<域名>.crt` 与 `<域名>.key`
+4. 兼容旧路径 `/etc/nginx/ssl/cert.crt` 与 `private.key`，但证书必须匹配反代域名
+
+配置过程中直接回车会使用自动匹配结果；明确填写证书和私钥路径时，才会使用手动指定的域名证书。支持 `openssl -checkhost` 时，脚本会校验证书 SAN，域名不匹配则拒绝写入 Nginx 配置。
 
 启用反代后，Realm 面板固定监听 `127.0.0.1` 并使用 HTTP 回源，同时清空面板自身的 IP 证书配置。后续更新面板时会自动识别反代配置，不会查找或复用其他项目位于 `/root/ygkkkca/` 的 IP 证书。
 
