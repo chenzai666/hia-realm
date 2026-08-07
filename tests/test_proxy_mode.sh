@@ -20,32 +20,6 @@ PANEL_SERVICE="realm-panel.service"
 
 [[ "$PANEL_CERT_DEFAULT" == '/etc/panel-ssl/cert.crt' ]]
 [[ "$PANEL_KEY_DEFAULT" == '/etc/panel-ssl/private.key' ]]
-PANEL_CERT_LEGACY_DEFAULT="$TEST_DIR/realm/panel-ssl/cert.crt"
-PANEL_KEY_LEGACY_DEFAULT="$TEST_DIR/realm/panel-ssl/private.key"
-PANEL_CERT_DEFAULT="$TEST_DIR/etc/panel-ssl/cert.crt"
-PANEL_KEY_DEFAULT="$TEST_DIR/etc/panel-ssl/private.key"
-mkdir -p "$(dirname "$PANEL_CERT_LEGACY_DEFAULT")"
-printf '%s\n' 'legacy certificate' > "$PANEL_CERT_LEGACY_DEFAULT"
-printf '%s\n' 'legacy private key' > "$PANEL_KEY_LEGACY_DEFAULT"
-realm_cert_pair=$(migrate_legacy_panel_certificate "$PANEL_CERT_LEGACY_DEFAULT" "$PANEL_KEY_LEGACY_DEFAULT")
-[[ "$realm_cert_pair" == "${PANEL_CERT_DEFAULT}|${PANEL_KEY_DEFAULT}" ]]
-cmp -s "$PANEL_CERT_LEGACY_DEFAULT" "$PANEL_CERT_DEFAULT"
-cmp -s "$PANEL_KEY_LEGACY_DEFAULT" "$PANEL_KEY_DEFAULT"
-
-ACME_BIN="$TEST_DIR/acme/acme.sh"
-ACME_CONF="$TEST_DIR/acme/1.1.1.1/1.1.1.1.conf"
-mkdir -p "$(dirname "$ACME_CONF")"
-touch "$ACME_BIN"
-chmod +x "$ACME_BIN"
-cat > "$ACME_CONF" <<'EOF'
-Le_RealKeyPath='/etc/realm/panel-ssl/private.key'
-Le_RealFullChainPath='/etc/realm/panel-ssl/cert.crt'
-EOF
-get_cert_ip_from_file() { printf '%s\n' '1.1.1.1'; }
-find_acme_sh() { printf '%s\n' "$ACME_BIN"; }
-sync_acme_certificate_install_path "$PANEL_CERT_DEFAULT" "$PANEL_KEY_DEFAULT"
-grep -qF "Le_RealKeyPath='${PANEL_KEY_DEFAULT}'" "$ACME_CONF"
-grep -qF "Le_RealFullChainPath='${PANEL_CERT_DEFAULT}'" "$ACME_CONF"
 
 mkdir -p "$NGINX_SSL_DIR"
 touch "$NGINX_CERT_DEFAULT" "$NGINX_KEY_DEFAULT"

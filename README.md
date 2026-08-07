@@ -411,8 +411,6 @@ http://<你的服务器IP>:4794
 私钥：/etc/panel-ssl/private.key
 ```
 
-旧路径 `/etc/realm/panel-ssl/cert.crt` 与 `private.key` 会在更新面板时自动迁移到上述路径，并同步 acme.sh 的续期安装路径。
-
 申请 IP 证书的前提：
 
 - 填写的地址必须是可路由的公网 IPv4。
